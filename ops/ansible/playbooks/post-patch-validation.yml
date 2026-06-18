@@ -1,0 +1,15 @@
+---
+- name: Post patch validation
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Collect failed services
+      ansible.builtin.command: systemctl --failed --no-legend
+      register: failed_services
+      changed_when: false
+      failed_when: false
+
+    - name: Report failed services
+      ansible.builtin.debug:
+        var: failed_services.stdout_lines

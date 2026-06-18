@@ -1,0 +1,236 @@
+:root {
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  color: #f6f1e8;
+  background:
+    radial-gradient(circle at top left, rgba(255, 176, 112, 0.24), transparent 36%),
+    radial-gradient(circle at top right, rgba(87, 132, 255, 0.18), transparent 34%),
+    linear-gradient(160deg, #13171f 0%, #1d2430 48%, #0f1218 100%);
+  line-height: 1.5;
+  font-weight: 400;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button {
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+}
+
+.app-shell {
+  max-width: 1380px;
+  margin: 0 auto;
+  padding: 32px 20px 48px;
+}
+
+.hero {
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  align-items: end;
+  margin-bottom: 24px;
+  padding: 28px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 24px;
+  background: rgba(9, 12, 18, 0.55);
+  backdrop-filter: blur(16px);
+}
+
+.eyebrow {
+  margin: 0 0 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: #f1ab67;
+  font-size: 0.75rem;
+}
+
+.hero h1 {
+  margin: 0;
+  font-size: clamp(2rem, 5vw, 4rem);
+}
+
+.hero-copy {
+  max-width: 740px;
+  margin: 12px 0 0;
+  color: rgba(246, 241, 232, 0.76);
+}
+
+.dashboard-grid {
+  display: grid;
+  gap: 20px;
+  grid-template-columns: 1fr 1.2fr 1.1fr;
+}
+
+.panel {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 20px;
+  background: rgba(10, 13, 18, 0.78);
+  min-height: 420px;
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 18px 20px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.panel-header h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.panel-body {
+  padding: 18px 20px;
+}
+
+.fleet-list {
+  display: grid;
+  gap: 12px;
+}
+
+.host-card,
+.finding-card,
+.remediation-card {
+  padding: 16px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.host-card {
+  display: grid;
+  gap: 4px;
+  text-align: left;
+  color: inherit;
+}
+
+.host-card.selected {
+  border-color: #f1ab67;
+  box-shadow: 0 0 0 1px rgba(241, 171, 103, 0.4);
+}
+
+.finding-card,
+.remediation-card {
+  margin-bottom: 12px;
+}
+
+.finding-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+  font-size: 0.8rem;
+  color: rgba(246, 241, 232, 0.76);
+}
+
+.severity {
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 0.7rem;
+}
+
+.severity-info {
+  background: rgba(111, 206, 255, 0.18);
+}
+
+.severity-medium {
+  background: rgba(255, 193, 93, 0.18);
+}
+
+.severity-high,
+.severity-critical {
+  background: rgba(255, 112, 112, 0.2);
+}
+
+.severity-low {
+  background: rgba(117, 229, 171, 0.18);
+}
+
+.primary-button,
+.secondary-button {
+  padding: 10px 14px;
+  border-radius: 999px;
+  transition: transform 160ms ease, opacity 160ms ease, background 160ms ease;
+}
+
+.primary-button {
+  background: linear-gradient(120deg, #f1ab67, #ff7d66);
+  color: #16191f;
+  font-weight: 700;
+}
+
+.secondary-button {
+  background: rgba(255, 255, 255, 0.08);
+  color: #f6f1e8;
+}
+
+.primary-button:hover,
+.secondary-button:hover {
+  transform: translateY(-1px);
+}
+
+.primary-button:disabled,
+.secondary-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.action-row {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+blockquote {
+  margin: 10px 0 0;
+  padding-left: 14px;
+  border-left: 3px solid rgba(241, 171, 103, 0.7);
+  color: rgba(246, 241, 232, 0.76);
+}
+
+blockquote footer {
+  margin-top: 4px;
+  color: rgba(246, 241, 232, 0.54);
+}
+
+pre {
+  overflow: auto;
+  padding: 12px;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.28);
+  color: #d6e2ff;
+}
+
+.error-banner {
+  margin-bottom: 18px;
+  padding: 12px 16px;
+  border-radius: 12px;
+  background: rgba(255, 112, 112, 0.18);
+  color: #ffd9d9;
+}
+
+@media (max-width: 1080px) {
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .hero {
+    flex-direction: column;
+    align-items: start;
+  }
+}
+

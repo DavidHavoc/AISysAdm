@@ -1,0 +1,16 @@
+{
+  "name": "ai-sysadm",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @ai-sysadm/shared && npm run build --workspace @ai-sysadm/api && npm run build --workspace @ai-sysadm/web",
+    "dev": "npm run dev --workspace @ai-sysadm/api",
+    "dev:api": "npm run dev --workspace @ai-sysadm/api",
+    "dev:web": "npm run dev --workspace @ai-sysadm/web",
+    "test": "npm run test --workspaces"
+  }
+}
