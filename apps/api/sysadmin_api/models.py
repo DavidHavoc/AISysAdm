@@ -45,6 +45,38 @@ class ModelTier(str, Enum):
     DETERMINISTIC = "deterministic"
 
 
+class CampaignStatus(str, Enum):
+    DRAFT = "draft"
+    PROPOSING = "proposing"
+    AWAITING_APPROVAL = "awaiting_approval"
+    READY = "ready"
+    RUNNING = "running"
+    PARTIALLY_SUCCEEDED = "partially_succeeded"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLING = "cancelling"
+    CANCELED = "canceled"
+
+
+class CampaignHostState(str, Enum):
+    SELECTED = "selected"
+    PROPOSAL_QUEUED = "proposal_queued"
+    PROPOSAL_RUNNING = "proposal_running"
+    AWAITING_APPROVAL = "awaiting_approval"
+    AWAITING_REBOOT_APPROVAL = "awaiting_reboot_approval"
+    APPROVED = "approved"
+    SCHEDULED = "scheduled"
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    REJECTED = "rejected"
+    BLOCKED = "blocked"
+    CANCELED = "canceled"
+    NO_ACTION = "no_action"
+    PLAN_CHANGED = "plan_changed"
+
+
 class AgentIdentity(ApiModel):
     name: AgentName
     responsibility: str
@@ -391,13 +423,20 @@ class Remediation(ApiModel):
     failure_policy: FailurePolicy = Field(default_factory=FailurePolicy)
     execution_timing: str
     maintenance_window: Optional[MaintenanceWindow] = None
-    approval_scope: str = "patch_and_reboot_if_required"
+    approval_scope: str = "patch_only"
     approval_state: str = "pending"
+    reboot_approval_state: str = "pending"
     execution_state: str = "not_started"
     plan_version: int = 1
     plan_hash: str = ""
     approved_by: Optional[str] = None
     approved_at: Optional[datetime] = None
+    approved_plan_version: Optional[int] = None
+    approved_plan_hash: Optional[str] = None
+    reboot_approved_by: Optional[str] = None
+    reboot_approved_at: Optional[datetime] = None
+    reboot_approved_plan_version: Optional[int] = None
+    reboot_approved_plan_hash: Optional[str] = None
     result: Optional[ExecutionResult] = None
     pre_change_protection: Dict[str, Any] = Field(
         default_factory=lambda: {"supported": False, "status": "deferred"}
@@ -423,6 +462,7 @@ class ScanJob(ApiModel):
     remediation_ids: List[str] = Field(default_factory=list)
     agent_run_ids: List[str] = Field(default_factory=list)
     agent_reports: List[AgentReport] = Field(default_factory=list)
+    campaign_id: Optional[str] = None
     error: Optional[str] = None
     created_at: datetime
     updated_at: datetime
@@ -433,19 +473,60 @@ class CampaignRequest(ApiModel):
     host_ids: List[str] = Field(min_length=1)
 
 
+class CampaignHostPlan(ApiModel):
+    id: str
+    campaign_id: str
+    host_id: str
+    hostname: str
+    state: CampaignHostState = CampaignHostState.SELECTED
+    scan_id: Optional[str] = None
+    remediation_id: Optional[str] = None
+    plan_version: Optional[int] = None
+    plan_hash: Optional[str] = None
+    approval_state: str = "pending"
+    reboot_approval_state: str = "pending"
+    approved_plan_version: Optional[int] = None
+    approved_plan_hash: Optional[str] = None
+    approved_by: Optional[str] = None
+    approved_at: Optional[datetime] = None
+    reboot_approved_by: Optional[str] = None
+    reboot_approved_at: Optional[datetime] = None
+    reboot_approved_plan_version: Optional[int] = None
+    reboot_approved_plan_hash: Optional[str] = None
+    job_id: Optional[str] = None
+    failure_summary: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
 class PatchCampaign(ApiModel):
     id: str
     name: str
     host_ids: List[str]
     remediation_ids: List[str]
-    status: str
+    hosts: List[CampaignHostPlan] = Field(default_factory=list)
+    status: CampaignStatus
     batch_size: int
     current_batch: int = 0
     total_batches: int
-    approval_scope: str = "patch_and_reboot_if_required"
     failure_summary: Optional[str] = None
+    canceled_by: Optional[str] = None
+    canceled_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
+
+
+class CampaignActionResponse(ApiModel):
+    campaign: PatchCampaign
+    jobs: List["DurableJob"] = Field(default_factory=list)
+
+
+class JobFailure(ApiModel):
+    failed_at: datetime
+    attempt: int
+    category: str
+    message: str
+    retryable: bool
 
 
 class DurableJob(ApiModel):
@@ -464,6 +545,10 @@ class DurableJob(ApiModel):
     current_phase: Optional[str] = None
     attempts: int = 0
     max_attempts: int = 3
+    lease_owner: Optional[str] = None
+    lease_expires_at: Optional[datetime] = None
+    heartbeat_at: Optional[datetime] = None
+    last_failure: Optional[JobFailure] = None
     error: Optional[str] = None
     result: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
@@ -514,6 +599,10 @@ class ApprovalRequest(ApiModel):
     plan_version: int
     plan_hash: str
     hostname_confirmation: str
+
+
+class RebootApprovalRequest(ApprovalRequest):
+    pass
 
 
 class LogPage(ApiModel):

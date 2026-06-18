@@ -88,6 +88,8 @@ def build_runtime(
         workflow=workflow,
         executor=executor,
         log_retention_days=resolved.log_retention_days,
+        job_lease_seconds=resolved.job_lease_seconds,
+        job_heartbeat_seconds=resolved.job_heartbeat_seconds,
     )
     return Runtime(
         settings=resolved,

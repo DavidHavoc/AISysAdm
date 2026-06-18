@@ -392,7 +392,23 @@ class AnsibleExecutor(RemediationExecutor):
             stderr=asyncio.subprocess.PIPE,
             env=environment,
         )
-        stdout, stderr = await process.communicate()
+        try:
+            stdout, stderr = await process.communicate()
+        except asyncio.CancelledError:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+            event_path.unlink(missing_ok=True)
+            raise
         output = "\n".join(
             value.decode(errors="replace").strip()
             for value in (stdout, stderr)
@@ -453,15 +469,29 @@ def failure_result(summary: str) -> ExecutionResult:
 def approval_guard(host: Host, remediation: Remediation) -> str:
     if remediation.approval_state != "approved":
         return "Execution blocked because the remediation is not approved"
-    if remediation.approval_scope != "patch_and_reboot_if_required":
+    if remediation.approval_scope != "patch_only":
         return "Execution blocked because the approval scope is invalid"
     if not remediation.approved_by or not remediation.approved_at:
         return "Execution blocked because approval metadata is incomplete"
     if (
-        remediation.reboot_assessment.status != "not_expected"
-        and not remediation.reboot_assessment.approved_if_required
+        remediation.approved_plan_version != remediation.plan_version
+        or remediation.approved_plan_hash != remediation.plan_hash
     ):
-        return "Execution blocked because required reboot scope is not approved"
+        return "Execution blocked because approval does not match the current plan"
+    if (
+        remediation.reboot_assessment.status != "not_expected"
+        and (
+            remediation.reboot_approval_state != "approved"
+            or not remediation.reboot_assessment.approved_if_required
+            or not remediation.reboot_approved_by
+            or not remediation.reboot_approved_at
+            or remediation.reboot_approved_plan_version
+            != remediation.plan_version
+            or remediation.reboot_approved_plan_hash
+            != remediation.plan_hash
+        )
+    ):
+        return "Execution blocked because separate reboot approval is missing"
     if (
         host.patch_policy.reboot_policy == "never"
         and remediation.reboot_assessment.status != "not_expected"

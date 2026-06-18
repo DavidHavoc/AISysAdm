@@ -274,8 +274,11 @@ export function App() {
                 <strong>{campaign.name}</strong>
                 <span>{campaign.status} / batch {campaign.batchSize} / {campaign.totalBatches} wave(s)</span>
                 <small>
-                  Campaign execution is deferred until every remediation can carry
-                  its own plan hash and hostname confirmation.
+                  {campaign.hosts.filter((host) =>
+                    host.state === "awaiting_approval"
+                    || host.state === "awaiting_reboot_approval"
+                    || host.state === "plan_changed"
+                  ).length} host(s) still require individual review.
                 </small>
               </div>
             ))}
@@ -323,6 +326,7 @@ export function App() {
                 <div className="finding-meta">
                   <span className={`severity severity-${remediation.riskLevel}`}>{remediation.riskLevel}</span>
                   <span>{remediation.approvalState}</span>
+                  <span>reboot: {remediation.rebootApprovalState}</span>
                   <span>{remediation.executionState}</span>
                 </div>
                 <h3>{remediation.title}</h3>
@@ -347,7 +351,7 @@ export function App() {
                 </dl>
                 <p className="reboot-note">{remediation.rebootAssessment.rationale}</p>
                 <p className="approval-note">
-                  Approval covers package changes and a reboot only if the post-patch check requires it.
+                  Patch approval is bound to this version and hash. Reboot approval is separate.
                 </p>
                 <div className="model-list">
                   {remediation.aiDecision.agentAssignments.map((agent) => (
@@ -362,7 +366,7 @@ export function App() {
                     disabled={remediation.approvalState !== "pending" || busy === `approve-${remediation.id}`}
                     onClick={() => void approve(remediation)}
                   >
-                    Approve Patch + Reboot
+                    Approve Patch Plan
                   </button>
                   <button
                     className="secondary-button"

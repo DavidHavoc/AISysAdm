@@ -3,6 +3,7 @@ import type {
   AgentRun,
   Alert,
   AuditEvent,
+  CampaignActionResponse,
   ConnectionTestResult,
   DurableJob,
   Finding,
@@ -106,10 +107,21 @@ export const api = {
     planVersion: number,
     planHash: string,
     hostnameConfirmation: string
-  ) => request<DurableJob>(`/remediations/${remediationId}/approve`, {
+  ) => request<Remediation>(`/remediations/${remediationId}/approve`, {
     method: "POST",
     body: JSON.stringify({ planVersion, planHash, hostnameConfirmation })
   }),
+  approveRemediationReboot: (
+    remediationId: string,
+    planVersion: number,
+    planHash: string,
+    hostnameConfirmation: string
+  ) => request<Remediation>(`/remediations/${remediationId}/reboot-approval`, {
+    method: "POST",
+    body: JSON.stringify({ planVersion, planHash, hostnameConfirmation })
+  }),
+  executeRemediation: (remediationId: string) =>
+    request<DurableJob>(`/remediations/${remediationId}/execute`, { method: "POST" }),
   rejectRemediation: (remediationId: string) =>
     request<Remediation>(`/remediations/${remediationId}/reject`, { method: "POST" }),
   listJobs: () => request<DurableJob[]>("/jobs"),
@@ -133,9 +145,50 @@ export const api = {
     request<Alert>(`/alerts/${id}/acknowledge`, { method: "POST" }),
   listAudit: () => request<AuditEvent[]>("/audit-events"),
   listCampaigns: () => request<PatchCampaign[]>("/campaigns"),
+  getCampaign: (campaignId: string) =>
+    request<PatchCampaign>(`/campaigns/${campaignId}`),
   createCampaign: (name: string, hostIds: string[]) =>
     request<PatchCampaign>("/campaigns", {
       method: "POST",
       body: JSON.stringify({ name, hostIds })
+    }),
+  createCampaignProposals: (campaignId: string) =>
+    request<CampaignActionResponse>(`/campaigns/${campaignId}/proposals`, {
+      method: "POST"
+    }),
+  approveCampaignHost: (
+    campaignId: string,
+    hostId: string,
+    planVersion: number,
+    planHash: string,
+    hostnameConfirmation: string
+  ) => request<PatchCampaign>(`/campaigns/${campaignId}/hosts/${hostId}/approve`, {
+    method: "POST",
+    body: JSON.stringify({ planVersion, planHash, hostnameConfirmation })
+  }),
+  approveCampaignHostReboot: (
+    campaignId: string,
+    hostId: string,
+    planVersion: number,
+    planHash: string,
+    hostnameConfirmation: string
+  ) => request<PatchCampaign>(
+    `/campaigns/${campaignId}/hosts/${hostId}/reboot-approval`,
+    {
+      method: "POST",
+      body: JSON.stringify({ planVersion, planHash, hostnameConfirmation })
+    }
+  ),
+  rejectCampaignHost: (campaignId: string, hostId: string) =>
+    request<PatchCampaign>(`/campaigns/${campaignId}/hosts/${hostId}/reject`, {
+      method: "POST"
+    }),
+  executeCampaign: (campaignId: string) =>
+    request<CampaignActionResponse>(`/campaigns/${campaignId}/execute`, {
+      method: "POST"
+    }),
+  cancelCampaign: (campaignId: string) =>
+    request<PatchCampaign>(`/campaigns/${campaignId}/cancel`, {
+      method: "POST"
     })
 };

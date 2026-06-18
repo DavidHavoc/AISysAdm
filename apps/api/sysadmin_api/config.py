@@ -6,6 +6,10 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+WORKER_HEALTH_KEY = "ai-sysadm:health:worker"
+BEAT_HEALTH_KEY = "ai-sysadm:health:beat"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=(".env", "../../.env"),
@@ -35,6 +39,9 @@ class Settings(BaseSettings):
     redis_url: Optional[str] = None
     agent_memory_ttl_seconds: int = 3600
     celery_task_always_eager: bool = False
+    job_lease_seconds: int = Field(default=120, ge=5)
+    job_heartbeat_seconds: int = Field(default=30, ge=1)
+    operational_health_ttl_seconds: int = Field(default=90, ge=30)
     log_retention_days: int = 90
 
     collector_mode: str = "demo"

@@ -16,11 +16,12 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 
-from .config import Settings
+from .config import BEAT_HEALTH_KEY, WORKER_HEALTH_KEY, Settings
 from .models import (
     Alert,
     ApprovalRequest,
     AuditEvent,
+    CampaignActionResponse,
     CampaignRequest,
     ConnectionTestRequest,
     ConnectionTestResult,
@@ -146,6 +147,31 @@ def create_app(
         if not ready:
             raise HTTPException(status_code=503, detail=checks)
         return {"ok": True, "checks": checks}
+
+    @app.get("/health/ops")
+    async def operational_health():
+        def marker(key: str):
+            try:
+                value = (
+                    resolved_runtime.redis_client.get(key)
+                    if resolved_runtime.redis_client
+                    else None
+                )
+            except Exception:
+                value = None
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            return {"healthy": bool(value), "lastSeenAt": value}
+
+        checks = {
+            "worker": marker(WORKER_HEALTH_KEY),
+            "celeryBeat": marker(BEAT_HEALTH_KEY),
+        }
+        healthy = all(item["healthy"] for item in checks.values())
+        response = {"ok": healthy, "checks": checks}
+        if not healthy:
+            raise HTTPException(status_code=503, detail=response)
+        return response
 
     @app.get("/health")
     async def health_compatibility():
@@ -341,8 +367,7 @@ def create_app(
 
     @app.post(
         "/remediations/{remediation_id}/approve",
-        response_model=DurableJob,
-        status_code=202,
+        response_model=Remediation,
     )
     async def approve_remediation(
         remediation_id: str,
@@ -350,9 +375,44 @@ def create_app(
         user: User = Depends(mutation_user),
     ):
         try:
-            job = resolved_runtime.service.prepare_remediation_job(
+            return resolved_runtime.service.approve_remediation_plan(
                 remediation_id,
                 payload,
+                user.username,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post(
+        "/remediations/{remediation_id}/reboot-approval",
+        response_model=Remediation,
+    )
+    async def approve_remediation_reboot(
+        remediation_id: str,
+        payload: ApprovalRequest,
+        user: User = Depends(mutation_user),
+    ):
+        try:
+            return resolved_runtime.service.approve_remediation_reboot(
+                remediation_id,
+                payload,
+                user.username,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post(
+        "/remediations/{remediation_id}/execute",
+        response_model=DurableJob,
+        status_code=202,
+    )
+    async def execute_remediation(
+        remediation_id: str,
+        user: User = Depends(mutation_user),
+    ):
+        try:
+            job = resolved_runtime.service.prepare_remediation_job(
+                remediation_id,
                 user.username,
             )
         except ValueError as error:
@@ -490,6 +550,16 @@ def create_app(
     async def list_campaigns(user: User = Depends(current_user)):
         return resolved_runtime.service.list_campaigns()
 
+    @app.get("/campaigns/{campaign_id}", response_model=PatchCampaign)
+    async def get_campaign(
+        campaign_id: str,
+        user: User = Depends(current_user),
+    ):
+        try:
+            return resolved_runtime.service.get_campaign(campaign_id)
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
     @app.post("/campaigns", response_model=PatchCampaign, status_code=201)
     async def create_campaign(
         payload: CampaignRequest,
@@ -498,6 +568,134 @@ def create_app(
         try:
             return resolved_runtime.service.create_campaign(
                 payload,
+                user.username,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post(
+        "/campaigns/{campaign_id}/proposals",
+        response_model=CampaignActionResponse,
+        status_code=202,
+    )
+    async def create_campaign_proposals(
+        campaign_id: str,
+        user: User = Depends(mutation_user),
+    ):
+        try:
+            campaign, jobs = resolved_runtime.service.queue_campaign_proposals(
+                campaign_id,
+                user.username,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        for job in jobs:
+            await resolved_dispatcher.dispatch(job)
+        return CampaignActionResponse(
+            campaign=resolved_runtime.service.get_campaign(campaign.id),
+            jobs=[
+                resolved_runtime.service.get_job(job.id)
+                for job in jobs
+                if resolved_runtime.service.get_job(job.id)
+            ],
+        )
+
+    @app.post(
+        "/campaigns/{campaign_id}/hosts/{host_id}/approve",
+        response_model=PatchCampaign,
+    )
+    async def approve_campaign_host(
+        campaign_id: str,
+        host_id: str,
+        payload: ApprovalRequest,
+        user: User = Depends(mutation_user),
+    ):
+        try:
+            return resolved_runtime.service.approve_campaign_host(
+                campaign_id,
+                host_id,
+                payload,
+                user.username,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post(
+        "/campaigns/{campaign_id}/hosts/{host_id}/reboot-approval",
+        response_model=PatchCampaign,
+    )
+    async def approve_campaign_host_reboot(
+        campaign_id: str,
+        host_id: str,
+        payload: ApprovalRequest,
+        user: User = Depends(mutation_user),
+    ):
+        try:
+            return resolved_runtime.service.approve_campaign_host_reboot(
+                campaign_id,
+                host_id,
+                payload,
+                user.username,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post(
+        "/campaigns/{campaign_id}/hosts/{host_id}/reject",
+        response_model=PatchCampaign,
+    )
+    async def reject_campaign_host(
+        campaign_id: str,
+        host_id: str,
+        user: User = Depends(mutation_user),
+    ):
+        try:
+            return resolved_runtime.service.reject_campaign_host(
+                campaign_id,
+                host_id,
+                user.username,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post(
+        "/campaigns/{campaign_id}/execute",
+        response_model=CampaignActionResponse,
+        status_code=202,
+    )
+    async def execute_campaign(
+        campaign_id: str,
+        user: User = Depends(mutation_user),
+    ):
+        try:
+            campaign, jobs = resolved_runtime.service.prepare_campaign_execution(
+                campaign_id,
+                user.username,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        for job in jobs:
+            await resolved_dispatcher.dispatch(job)
+        return CampaignActionResponse(
+            campaign=resolved_runtime.service.get_campaign(campaign.id),
+            jobs=[
+                resolved_runtime.service.get_job(job.id)
+                for job in jobs
+                if resolved_runtime.service.get_job(job.id)
+            ],
+        )
+
+    @app.post(
+        "/campaigns/{campaign_id}/cancel",
+        response_model=PatchCampaign,
+    )
+    async def cancel_campaign(
+        campaign_id: str,
+        user: User = Depends(mutation_user),
+    ):
+        try:
+            return resolved_runtime.service.cancel_campaign(
+                campaign_id,
                 user.username,
             )
         except ValueError as error:

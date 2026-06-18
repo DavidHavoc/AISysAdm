@@ -175,13 +175,27 @@ export const remediationSchema = z.object({
     canaryCount: z.number(),
     rationale: z.string()
   }),
+  failurePolicy: z.object({
+    stopRemainingHosts: z.boolean(),
+    notifyOperator: z.boolean(),
+    attemptPredefinedRecovery: z.boolean(),
+    recoveryActions: z.array(z.string())
+  }),
   executionTiming: z.string(),
+  approvalScope: z.literal("patch_only"),
   approvalState: z.string(),
+  rebootApprovalState: z.string(),
   executionState: z.string(),
   planVersion: z.number(),
   planHash: z.string(),
   approvedBy: z.string().nullable(),
   approvedAt: z.string().nullable(),
+  approvedPlanVersion: z.number().nullable(),
+  approvedPlanHash: z.string().nullable(),
+  rebootApprovedBy: z.string().nullable(),
+  rebootApprovedAt: z.string().nullable(),
+  rebootApprovedPlanVersion: z.number().nullable(),
+  rebootApprovedPlanHash: z.string().nullable(),
   result: z.object({
     success: z.boolean(),
     summary: z.string(),
@@ -195,6 +209,7 @@ export const remediationSchema = z.object({
       changed: z.boolean()
     }))
   }).nullable(),
+  preChangeProtection: z.record(z.string(), z.unknown()),
   createdAt: z.string(),
   updatedAt: z.string()
 });
@@ -216,6 +231,16 @@ export const jobSchema = z.object({
   currentPhase: z.string().nullable(),
   attempts: z.number(),
   maxAttempts: z.number(),
+  leaseOwner: z.string().nullable(),
+  leaseExpiresAt: z.string().nullable(),
+  heartbeatAt: z.string().nullable(),
+  lastFailure: z.object({
+    failedAt: z.string(),
+    attempt: z.number(),
+    category: z.string(),
+    message: z.string(),
+    retryable: z.boolean()
+  }).nullable(),
   error: z.string().nullable(),
   result: z.record(z.string(), z.unknown()),
   createdAt: z.string(),
@@ -225,21 +250,88 @@ export const jobSchema = z.object({
 });
 export type DurableJob = z.infer<typeof jobSchema>;
 
+export const campaignStatusSchema = z.enum([
+  "draft",
+  "proposing",
+  "awaiting_approval",
+  "ready",
+  "running",
+  "partially_succeeded",
+  "succeeded",
+  "failed",
+  "cancelling",
+  "canceled"
+]);
+
+export const campaignHostStateSchema = z.enum([
+  "selected",
+  "proposal_queued",
+  "proposal_running",
+  "awaiting_approval",
+  "awaiting_reboot_approval",
+  "approved",
+  "scheduled",
+  "queued",
+  "running",
+  "succeeded",
+  "failed",
+  "rejected",
+  "blocked",
+  "canceled",
+  "no_action",
+  "plan_changed"
+]);
+
+export const campaignHostPlanSchema = z.object({
+  id: z.string(),
+  campaignId: z.string(),
+  hostId: z.string(),
+  hostname: z.string(),
+  state: campaignHostStateSchema,
+  scanId: z.string().nullable(),
+  remediationId: z.string().nullable(),
+  planVersion: z.number().nullable(),
+  planHash: z.string().nullable(),
+  approvalState: z.string(),
+  rebootApprovalState: z.string(),
+  approvedPlanVersion: z.number().nullable(),
+  approvedPlanHash: z.string().nullable(),
+  approvedBy: z.string().nullable(),
+  approvedAt: z.string().nullable(),
+  rebootApprovedBy: z.string().nullable(),
+  rebootApprovedAt: z.string().nullable(),
+  rebootApprovedPlanVersion: z.number().nullable(),
+  rebootApprovedPlanHash: z.string().nullable(),
+  jobId: z.string().nullable(),
+  failureSummary: z.string().nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string()
+});
+export type CampaignHostPlan = z.infer<typeof campaignHostPlanSchema>;
+
 export const campaignSchema = z.object({
   id: z.string(),
   name: z.string(),
   hostIds: z.array(z.string()),
   remediationIds: z.array(z.string()),
-  status: z.string(),
+  hosts: z.array(campaignHostPlanSchema),
+  status: campaignStatusSchema,
   batchSize: z.number(),
   currentBatch: z.number(),
   totalBatches: z.number(),
-  approvalScope: z.string(),
   failureSummary: z.string().nullable(),
+  canceledBy: z.string().nullable(),
+  canceledAt: z.string().nullable(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
 export type PatchCampaign = z.infer<typeof campaignSchema>;
+
+export const campaignActionResponseSchema = z.object({
+  campaign: campaignSchema,
+  jobs: z.array(jobSchema)
+});
+export type CampaignActionResponse = z.infer<typeof campaignActionResponseSchema>;
 
 export const scanSchema = z.object({
   id: z.string(),
@@ -251,6 +343,7 @@ export const scanSchema = z.object({
   findingIds: z.array(z.string()),
   remediationIds: z.array(z.string()),
   agentRunIds: z.array(z.string()),
+  campaignId: z.string().nullable(),
   error: z.string().nullable(),
   createdAt: z.string(),
   updatedAt: z.string()

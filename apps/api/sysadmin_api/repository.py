@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from threading import RLock
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar
 
@@ -12,6 +12,7 @@ from .database import (
     AlertRecord,
     AuditRecord,
     Base,
+    CampaignHostRecord,
     CampaignRecord,
     CredentialRecord,
     FindingRecord,
@@ -31,11 +32,13 @@ from .models import (
     AgentRun,
     Alert,
     AuditEvent,
+    CampaignHostPlan,
     DurableJob,
     Finding,
     Host,
     HostSchedule,
     HostSnapshot,
+    JobFailure,
     PatchCampaign,
     Remediation,
     ScanJob,
@@ -45,6 +48,63 @@ from .models import (
 )
 
 ModelT = TypeVar("ModelT")
+
+
+def normalized_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def later_datetime(
+    first: Optional[datetime],
+    second: Optional[datetime],
+) -> Optional[datetime]:
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return (
+        first
+        if normalized_datetime(first) >= normalized_datetime(second)
+        else second
+    )
+
+
+def lease_is_expired(
+    lease_expires_at: Optional[datetime],
+    current: datetime,
+) -> bool:
+    if lease_expires_at is None:
+        return True
+    return normalized_datetime(lease_expires_at) <= normalized_datetime(current)
+
+
+def lease_expiration_failure(job: DurableJob, failed_at: datetime) -> JobFailure:
+    return JobFailure(
+        failed_at=failed_at,
+        attempt=job.attempts,
+        category="worker_lease_expired",
+        message="Worker lease expired before the job completed",
+        retryable=job.attempts < job.max_attempts,
+    )
+
+
+def terminalize_exhausted_job(job: DurableJob, failed_at: datetime) -> None:
+    message = (
+        job.last_failure.message
+        if job.last_failure
+        else "Job retry attempts were exhausted"
+    )
+    job.status = "failed"
+    job.error = message[:2000]
+    job.current_phase = "failed"
+    job.completed_at = failed_at
+    job.lease_owner = None
+    job.lease_expires_at = None
+    job.updated_at = failed_at
+    if job.last_failure:
+        job.last_failure.retryable = False
 
 
 class Repository:
@@ -60,7 +120,28 @@ class Repository:
     def healthcheck(self) -> bool:
         raise NotImplementedError
 
-    def claim_job(self, job_id: str, started_at: datetime) -> Optional[DurableJob]:
+    def claim_job(
+        self,
+        job_id: str,
+        lease_owner: str,
+        started_at: datetime,
+        lease_expires_at: datetime,
+    ) -> Optional[DurableJob]:
+        raise NotImplementedError
+
+    def heartbeat_job(
+        self,
+        job_id: str,
+        lease_owner: str,
+        heartbeat_at: datetime,
+        lease_expires_at: datetime,
+    ) -> Optional[DurableJob]:
+        raise NotImplementedError
+
+    def recover_expired_jobs(
+        self,
+        recovered_at: datetime,
+    ) -> Tuple[List[DurableJob], List[DurableJob]]:
         raise NotImplementedError
 
 
@@ -205,30 +286,131 @@ class InMemoryRepository(Repository):
     def get_campaign(self, campaign_id: str) -> Optional[PatchCampaign]:
         return self.campaigns.get(campaign_id)
 
-    def save_job(self, job: DurableJob) -> DurableJob:
-        self.jobs[job.id] = job
+    def save_job(
+        self,
+        job: DurableJob,
+        lease_owner: Optional[str] = None,
+    ) -> Optional[DurableJob]:
+        with self._lock:
+            current = self.jobs.get(job.id)
+            if lease_owner is not None:
+                if (
+                    not current
+                    or current.lease_owner != lease_owner
+                    or current.status != "running"
+                ):
+                    return None
+                if job.status == "running":
+                    job.heartbeat_at = later_datetime(
+                        job.heartbeat_at,
+                        current.heartbeat_at,
+                    )
+                    job.lease_expires_at = later_datetime(
+                        job.lease_expires_at,
+                        current.lease_expires_at,
+                    )
+            self.jobs[job.id] = job.model_copy(deep=True)
         return job
 
-    def claim_job(self, job_id: str, started_at: datetime) -> Optional[DurableJob]:
+    def claim_job(
+        self,
+        job_id: str,
+        lease_owner: str,
+        started_at: datetime,
+        lease_expires_at: datetime,
+    ) -> Optional[DurableJob]:
         with self._lock:
-            job = self.jobs.get(job_id)
-            if not job or job.status != "queued":
+            stored = self.jobs.get(job_id)
+            if not stored:
                 return None
+            job = stored.model_copy(deep=True)
+            expired = job.status == "running" and lease_is_expired(
+                job.lease_expires_at,
+                started_at,
+            )
+            if job.status != "queued" and not expired:
+                return None
+            if job.attempts >= job.max_attempts:
+                terminalize_exhausted_job(job, started_at)
+                self.jobs[job.id] = job.model_copy(deep=True)
+                return None
+            if expired:
+                job.last_failure = lease_expiration_failure(job, started_at)
             job.status = "running"
             job.started_at = job.started_at or started_at
             job.attempts += 1
+            job.lease_owner = lease_owner
+            job.lease_expires_at = lease_expires_at
+            job.heartbeat_at = started_at
+            job.completed_at = None
+            job.error = None
             job.updated_at = started_at
-            self.jobs[job.id] = job
+            self.jobs[job.id] = job.model_copy(deep=True)
             return job
 
+    def heartbeat_job(
+        self,
+        job_id: str,
+        lease_owner: str,
+        heartbeat_at: datetime,
+        lease_expires_at: datetime,
+    ) -> Optional[DurableJob]:
+        with self._lock:
+            stored = self.jobs.get(job_id)
+            if (
+                not stored
+                or stored.status != "running"
+                or stored.lease_owner != lease_owner
+            ):
+                return None
+            job = stored.model_copy(deep=True)
+            job.heartbeat_at = heartbeat_at
+            job.lease_expires_at = lease_expires_at
+            job.updated_at = heartbeat_at
+            self.jobs[job.id] = job.model_copy(deep=True)
+            return job
+
+    def recover_expired_jobs(
+        self,
+        recovered_at: datetime,
+    ) -> Tuple[List[DurableJob], List[DurableJob]]:
+        recovered: List[DurableJob] = []
+        exhausted: List[DurableJob] = []
+        with self._lock:
+            for stored in list(self.jobs.values()):
+                if stored.status != "running" or not lease_is_expired(
+                    stored.lease_expires_at,
+                    recovered_at,
+                ):
+                    continue
+                job = stored.model_copy(deep=True)
+                job.last_failure = lease_expiration_failure(job, recovered_at)
+                job.lease_owner = None
+                job.lease_expires_at = None
+                job.updated_at = recovered_at
+                if job.attempts >= job.max_attempts:
+                    terminalize_exhausted_job(job, recovered_at)
+                    exhausted.append(job)
+                else:
+                    job.status = "queued"
+                    job.current_phase = "retry_scheduled"
+                    recovered.append(job)
+                self.jobs[job.id] = job.model_copy(deep=True)
+        return recovered, exhausted
+
     def get_job(self, job_id: str) -> Optional[DurableJob]:
-        return self.jobs.get(job_id)
+        job = self.jobs.get(job_id)
+        return job.model_copy(deep=True) if job else None
 
     def get_job_by_idempotency(self, key: str) -> Optional[DurableJob]:
-        return next((item for item in self.jobs.values() if item.idempotency_key == key), None)
+        job = next(
+            (item for item in self.jobs.values() if item.idempotency_key == key),
+            None,
+        )
+        return job.model_copy(deep=True) if job else None
 
     def list_jobs(self) -> List[DurableJob]:
-        return list(self.jobs.values())
+        return [item.model_copy(deep=True) for item in self.jobs.values()]
 
     def host_has_active_scan(self, host_id: str) -> bool:
         return any(
@@ -601,37 +783,139 @@ class SqlRepository(Repository):
         return self._get_payload(RemediationRecord, Remediation, remediation_id)
 
     def save_campaign(self, campaign: PatchCampaign) -> PatchCampaign:
-        return self._upsert_payload(
-            CampaignRecord,
-            campaign,
-            {
-                "status": campaign.status,
+        with self.Session.begin() as session:
+            record = session.get(CampaignRecord, campaign.id)
+            values = {
+                "status": (
+                    campaign.status.value
+                    if hasattr(campaign.status, "value")
+                    else str(campaign.status)
+                ),
+                "payload": self._payload(campaign),
                 "created_at": campaign.created_at,
                 "updated_at": campaign.updated_at,
-            },
-        )
+            }
+            if record:
+                for key, value in values.items():
+                    setattr(record, key, value)
+            else:
+                session.add(CampaignRecord(id=campaign.id, **values))
+            for host_plan in campaign.hosts:
+                record_id = host_plan.id
+                host_record = session.get(CampaignHostRecord, record_id)
+                host_values = {
+                    "campaign_id": campaign.id,
+                    "host_id": host_plan.host_id,
+                    "remediation_id": host_plan.remediation_id,
+                    "state": (
+                        host_plan.state.value
+                        if hasattr(host_plan.state, "value")
+                        else str(host_plan.state)
+                    ),
+                    "approval_state": host_plan.approval_state,
+                    "reboot_approval_state": host_plan.reboot_approval_state,
+                    "plan_version": host_plan.plan_version,
+                    "plan_hash": host_plan.plan_hash,
+                    "job_id": host_plan.job_id,
+                    "payload": self._payload(host_plan),
+                    "created_at": host_plan.created_at,
+                    "updated_at": host_plan.updated_at,
+                }
+                if host_record:
+                    for key, value in host_values.items():
+                        setattr(host_record, key, value)
+                else:
+                    session.add(CampaignHostRecord(id=record_id, **host_values))
+        return campaign
 
     def list_campaigns(self) -> List[PatchCampaign]:
-        return self._list_payload(CampaignRecord, PatchCampaign)
+        return [
+            self._campaign_with_hosts(item)
+            for item in self._list_payload(CampaignRecord, PatchCampaign)
+        ]
 
     def get_campaign(self, campaign_id: str) -> Optional[PatchCampaign]:
-        return self._get_payload(CampaignRecord, PatchCampaign, campaign_id)
+        campaign = self._get_payload(CampaignRecord, PatchCampaign, campaign_id)
+        return self._campaign_with_hosts(campaign) if campaign else None
 
-    def save_job(self, job: DurableJob) -> DurableJob:
-        return self._upsert_payload(
-            JobRecord,
-            job,
-            {
-                "job_type": job.job_type,
-                "status": job.status,
-                "host_id": job.host_id,
-                "idempotency_key": job.idempotency_key,
-                "created_at": job.created_at,
-                "updated_at": job.updated_at,
-            },
-        )
+    def _campaign_with_hosts(self, campaign: PatchCampaign) -> PatchCampaign:
+        with self.Session() as session:
+            rows = session.scalars(
+                select(CampaignHostRecord).where(
+                    CampaignHostRecord.campaign_id == campaign.id
+                )
+            ).all()
+        if rows:
+            campaign.hosts = [
+                CampaignHostPlan.model_validate(row.payload)
+                for row in rows
+            ]
+            campaign.hosts.sort(key=lambda item: item.hostname)
+        return campaign
 
-    def claim_job(self, job_id: str, started_at: datetime) -> Optional[DurableJob]:
+    @staticmethod
+    def _job_values(job: DurableJob) -> Dict[str, Any]:
+        return {
+            "job_type": job.job_type,
+            "status": job.status,
+            "host_id": job.host_id,
+            "idempotency_key": job.idempotency_key,
+            "lease_owner": job.lease_owner,
+            "lease_expires_at": job.lease_expires_at,
+            "heartbeat_at": job.heartbeat_at,
+            "attempts": job.attempts,
+            "last_failure": (
+                job.last_failure.model_dump(mode="json")
+                if job.last_failure
+                else None
+            ),
+            "payload": SqlRepository._payload(job),
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+        }
+
+    def save_job(
+        self,
+        job: DurableJob,
+        lease_owner: Optional[str] = None,
+    ) -> Optional[DurableJob]:
+        with self.Session.begin() as session:
+            row = session.scalar(
+                select(JobRecord)
+                .where(JobRecord.id == job.id)
+                .with_for_update()
+            )
+            if lease_owner is not None:
+                if (
+                    not row
+                    or row.lease_owner != lease_owner
+                    or row.status != "running"
+                ):
+                    return None
+                if job.status == "running":
+                    job.heartbeat_at = later_datetime(
+                        job.heartbeat_at,
+                        row.heartbeat_at,
+                    )
+                    job.lease_expires_at = later_datetime(
+                        job.lease_expires_at,
+                        row.lease_expires_at,
+                    )
+            values = self._job_values(job)
+            if row:
+                for key, value in values.items():
+                    setattr(row, key, value)
+            else:
+                session.add(JobRecord(id=job.id, **values))
+        return job
+
+    def claim_job(
+        self,
+        job_id: str,
+        lease_owner: str,
+        started_at: datetime,
+        lease_expires_at: datetime,
+    ) -> Optional[DurableJob]:
         with self.Session.begin() as session:
             row = session.scalar(
                 select(JobRecord)
@@ -641,16 +925,89 @@ class SqlRepository(Repository):
             if not row:
                 return None
             job = DurableJob.model_validate(row.payload)
-            if job.status != "queued":
+            expired = job.status == "running" and lease_is_expired(
+                job.lease_expires_at,
+                started_at,
+            )
+            if job.status != "queued" and not expired:
                 return None
+            if job.attempts >= job.max_attempts:
+                terminalize_exhausted_job(job, started_at)
+                for key, value in self._job_values(job).items():
+                    setattr(row, key, value)
+                return None
+            if expired:
+                job.last_failure = lease_expiration_failure(job, started_at)
             job.status = "running"
             job.started_at = job.started_at or started_at
             job.attempts += 1
+            job.lease_owner = lease_owner
+            job.lease_expires_at = lease_expires_at
+            job.heartbeat_at = started_at
+            job.completed_at = None
+            job.error = None
             job.updated_at = started_at
-            row.status = job.status
-            row.updated_at = job.updated_at
-            row.payload = self._payload(job)
+            for key, value in self._job_values(job).items():
+                setattr(row, key, value)
             return job
+
+    def heartbeat_job(
+        self,
+        job_id: str,
+        lease_owner: str,
+        heartbeat_at: datetime,
+        lease_expires_at: datetime,
+    ) -> Optional[DurableJob]:
+        with self.Session.begin() as session:
+            row = session.scalar(
+                select(JobRecord)
+                .where(JobRecord.id == job_id)
+                .with_for_update()
+            )
+            if (
+                not row
+                or row.status != "running"
+                or row.lease_owner != lease_owner
+            ):
+                return None
+            job = DurableJob.model_validate(row.payload)
+            job.heartbeat_at = heartbeat_at
+            job.lease_expires_at = lease_expires_at
+            job.updated_at = heartbeat_at
+            for key, value in self._job_values(job).items():
+                setattr(row, key, value)
+            return job
+
+    def recover_expired_jobs(
+        self,
+        recovered_at: datetime,
+    ) -> Tuple[List[DurableJob], List[DurableJob]]:
+        recovered: List[DurableJob] = []
+        exhausted: List[DurableJob] = []
+        with self.Session.begin() as session:
+            rows = session.scalars(
+                select(JobRecord)
+                .where(JobRecord.status == "running")
+                .with_for_update(skip_locked=True)
+            ).all()
+            for row in rows:
+                job = DurableJob.model_validate(row.payload)
+                if not lease_is_expired(job.lease_expires_at, recovered_at):
+                    continue
+                job.last_failure = lease_expiration_failure(job, recovered_at)
+                job.lease_owner = None
+                job.lease_expires_at = None
+                job.updated_at = recovered_at
+                if job.attempts >= job.max_attempts:
+                    terminalize_exhausted_job(job, recovered_at)
+                    exhausted.append(job)
+                else:
+                    job.status = "queued"
+                    job.current_phase = "retry_scheduled"
+                    recovered.append(job)
+                for key, value in self._job_values(job).items():
+                    setattr(row, key, value)
+        return recovered, exhausted
 
     def get_job(self, job_id: str) -> Optional[DurableJob]:
         return self._get_payload(JobRecord, DurableJob, job_id)

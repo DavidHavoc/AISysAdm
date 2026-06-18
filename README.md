@@ -31,7 +31,7 @@ execution. Safe demo collection and simulated execution are enabled by default.
 - Structured logs, alerts, audit events, and 90-day log retention
 - External provider routing with sensitive-value redaction
 - PostgreSQL and Redis readiness checks
-- Campaign creation and listing
+- Campaign proposals, per-host approvals, execution, cancellation, and results
 
 ## Safety model
 
@@ -254,8 +254,9 @@ npm run test:api
 
 ## Private-alpha limitations
 
-- Campaigns can be created and listed, but campaign approval and execution are
-  not implemented.
+- Campaign execution controls are not yet enabled in the dashboard. The API
+  contract is documented in
+  [`docs/frontend-campaign-contract.md`](docs/frontend-campaign-contract.md).
 - Jobs have atomic claiming, but worker leases, heartbeats, bounded retries,
   and stale-job recovery are not implemented.
 - Readiness checks PostgreSQL and Redis, but not worker or Celery Beat health.

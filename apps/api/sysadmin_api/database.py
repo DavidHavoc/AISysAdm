@@ -166,6 +166,35 @@ class CampaignRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class CampaignHostRecord(Base):
+    __tablename__ = "campaign_hosts"
+    __table_args__ = (
+        UniqueConstraint(
+            "campaign_id",
+            "host_id",
+            name="uq_campaign_host_campaign_host",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(196), primary_key=True)
+    campaign_id: Mapped[str] = mapped_column(String(96), nullable=False, index=True)
+    host_id: Mapped[str] = mapped_column(String(96), nullable=False, index=True)
+    remediation_id: Mapped[Optional[str]] = mapped_column(String(96), index=True)
+    state: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    approval_state: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    reboot_approval_state: Mapped[str] = mapped_column(
+        String(40),
+        nullable=False,
+        index=True,
+    )
+    plan_version: Mapped[Optional[int]] = mapped_column(Integer)
+    plan_hash: Mapped[Optional[str]] = mapped_column(String(64))
+    job_id: Mapped[Optional[str]] = mapped_column(String(96), index=True)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class JobRecord(Base):
     __tablename__ = "jobs"
 
@@ -174,6 +203,14 @@ class JobRecord(Base):
     status: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
     host_id: Mapped[Optional[str]] = mapped_column(String(96), index=True)
     idempotency_key: Mapped[str] = mapped_column(String(180), unique=True, nullable=False)
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_failure: Mapped[Optional[dict]] = mapped_column(JSON)
     payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

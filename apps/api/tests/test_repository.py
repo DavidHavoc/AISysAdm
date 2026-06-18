@@ -1,6 +1,14 @@
 from datetime import timedelta
 
-from sysadmin_api.models import DurableJob, Severity, StructuredLogEvent, utc_now
+from sysadmin_api.models import (
+    CampaignHostPlan,
+    CampaignStatus,
+    DurableJob,
+    PatchCampaign,
+    Severity,
+    StructuredLogEvent,
+    utc_now,
+)
 from sysadmin_api.repository import SqlRepository
 
 
@@ -22,8 +30,18 @@ def test_sql_repository_claims_a_durable_job_once(tmp_path):
     )
     repository.save_job(job)
 
-    claimed = repository.claim_job(job.id, now)
-    duplicate = repository.claim_job(job.id, now)
+    claimed = repository.claim_job(
+        job.id,
+        "worker-1",
+        now,
+        now + timedelta(seconds=60),
+    )
+    duplicate = repository.claim_job(
+        job.id,
+        "worker-2",
+        now,
+        now + timedelta(seconds=60),
+    )
 
     assert claimed is not None
     assert claimed.status == "running"
@@ -64,3 +82,42 @@ def test_sql_repository_purges_only_expired_logs(tmp_path):
     assert deleted == 1
     assert repository.get_log_event("old-log") is None
     assert repository.get_log_event("current-log") is not None
+
+
+def test_sql_repository_persists_campaign_host_plan_binding(tmp_path):
+    repository = SqlRepository(
+        "sqlite:///%s" % (tmp_path / "campaigns.db"),
+        create_schema=True,
+    )
+    now = utc_now()
+    host_plan = CampaignHostPlan(
+        id="campaign-host-1",
+        campaign_id="campaign-1",
+        host_id="host-1",
+        hostname="web-1",
+        state="awaiting_approval",
+        remediation_id="remediation-1",
+        plan_version=7,
+        plan_hash="a" * 64,
+        created_at=now,
+        updated_at=now,
+    )
+    campaign = PatchCampaign(
+        id="campaign-1",
+        name="Production wave",
+        host_ids=["host-1"],
+        remediation_ids=["remediation-1"],
+        hosts=[host_plan],
+        status=CampaignStatus.AWAITING_APPROVAL,
+        batch_size=1,
+        total_batches=1,
+        created_at=now,
+        updated_at=now,
+    )
+
+    repository.save_campaign(campaign)
+    loaded = repository.get_campaign(campaign.id)
+
+    assert loaded is not None
+    assert loaded.hosts[0].plan_version == 7
+    assert loaded.hosts[0].plan_hash == "a" * 64

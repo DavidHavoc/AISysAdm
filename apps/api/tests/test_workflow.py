@@ -22,6 +22,7 @@ from sysadmin_api.models import (
     utc_now,
 )
 from sysadmin_api.providers import ModelRouter
+from sysadmin_api.verifier import DeterministicVerifier
 
 
 def host_input(name: str = "web-1", **overrides) -> HostInput:
@@ -69,6 +70,17 @@ async def test_three_agents_and_reboot_are_explicit(service):
         report.agent.model_tier == "deterministic"
         for report in scan.agent_reports
     )
+    peer_reviews = [
+        message
+        for message in service.list_agent_messages(scan.id)
+        if message.from_agent in ("log_analyst", "linux_state_analyst")
+        and message.to_agent in ("log_analyst", "linux_state_analyst")
+    ]
+    assert len(peer_reviews) == 2
+    assert {message.from_agent for message in peer_reviews} == {
+        "log_analyst",
+        "linux_state_analyst",
+    }
 
     remediation = service.list_remediations()[0]
     assert remediation.update_scope == "all"
@@ -84,9 +96,19 @@ async def test_approval_binds_job_to_exact_plan_and_required_reboot(service):
     scan = await completed_scan(service, host)
     remediation = service.repository.get_remediation(scan.remediation_ids[0])
 
-    job = service.prepare_remediation_job(
+    approved_plan = service.approve_remediation_plan(
         remediation.id,
         approval_for(host, remediation),
+        "admin",
+    )
+    assert approved_plan.reboot_approval_state == "pending"
+    service.approve_remediation_reboot(
+        remediation.id,
+        approval_for(host, remediation),
+        "admin",
+    )
+    job = service.prepare_remediation_job(
+        remediation.id,
         "admin",
     )
     completed = await service.process_remediation(job.id)
@@ -105,9 +127,18 @@ async def test_changed_plan_is_blocked_before_executor_runs(service):
     host = service.create_host(host_input())
     scan = await completed_scan(service, host)
     remediation = service.repository.get_remediation(scan.remediation_ids[0])
-    job = service.prepare_remediation_job(
+    service.approve_remediation_plan(
         remediation.id,
         approval_for(host, remediation),
+        "admin",
+    )
+    service.approve_remediation_reboot(
+        remediation.id,
+        approval_for(host, remediation),
+        "admin",
+    )
+    job = service.prepare_remediation_job(
+        remediation.id,
         "admin",
     )
     remediation.update_scope = "security"
@@ -116,8 +147,11 @@ async def test_changed_plan_is_blocked_before_executor_runs(service):
     result = await service.process_remediation(job.id)
 
     assert result.status == "failed"
-    assert "content changed" in result.error
-    assert service.repository.get_remediation(remediation.id).execution_state == "blocked"
+    assert "approved plan" in result.error
+    invalidated = service.repository.get_remediation(remediation.id)
+    assert invalidated.approval_state == "pending"
+    assert invalidated.reboot_approval_state == "pending"
+    assert invalidated.execution_state == "blocked"
 
 
 @pytest.mark.asyncio
@@ -160,9 +194,18 @@ async def test_maintenance_window_waits_after_approval(service):
     scan = await completed_scan(service, host)
     remediation = service.repository.get_remediation(scan.remediation_ids[0])
 
-    job = service.prepare_remediation_job(
+    service.approve_remediation_plan(
         remediation.id,
         approval_for(host, remediation),
+        "admin",
+    )
+    service.approve_remediation_reboot(
+        remediation.id,
+        approval_for(host, remediation),
+        "admin",
+    )
+    job = service.prepare_remediation_job(
+        remediation.id,
         "admin",
     )
 
@@ -180,15 +223,21 @@ async def test_reboot_never_policy_blocks_uncertain_or_required_reboot(service):
     scan = await completed_scan(service, host)
     remediation = service.repository.get_remediation(scan.remediation_ids[0])
 
+    service.approve_remediation_plan(
+        remediation.id,
+        approval_for(host, remediation),
+        "admin",
+    )
     with pytest.raises(ValueError, match="forbids reboot risk"):
-        service.prepare_remediation_job(
+        service.approve_remediation_reboot(
             remediation.id,
             approval_for(host, remediation),
             "admin",
         )
 
     blocked = service.repository.get_remediation(remediation.id)
-    assert blocked.approval_state == "manual_review"
+    assert blocked.approval_state == "approved"
+    assert blocked.reboot_approval_state == "blocked"
     assert blocked.execution_state == "blocked"
 
 
@@ -289,6 +338,46 @@ def test_provider_cannot_relax_deterministic_evidence_request():
     )
 
     assert result["response"] == "request_evidence"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_ai_action_is_rejected_before_plan_synthesis(service):
+    host = service.create_host(host_input())
+    collected = await service.collector.collect(host)
+    finding = Finding(
+        id="unsupported-finding",
+        host_id=host.id,
+        source_agent=AgentName.LOG_ANALYST,
+        category="logs",
+        severity=Severity.HIGH,
+        summary="Run arbitrary command",
+        explanation="Unsupported provider claim",
+        evidence=[
+            {
+                "source": "package inventory",
+                "excerpt": "updates available",
+                "citation": "packages.updates",
+            }
+        ],
+        recommended_action=RecommendedAction(
+            action_type="run_shell",
+            title="Run shell command",
+            rationale="Provider requested an uncataloged action",
+        ),
+        requires_approval=True,
+        confidence=0.99,
+        created_at=utc_now(),
+    )
+
+    verified, rejected = DeterministicVerifier().verify_findings(
+        collected.snapshot,
+        [finding],
+        [],
+    )
+
+    assert verified == []
+    assert rejected
+    assert "not in the remediation catalog" in rejected[0]
 
 
 def test_model_router_assigns_capable_and_economy_models(settings):
