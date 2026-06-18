@@ -1,0 +1,23 @@
+---
+- name: Collect predefined recovery diagnostics
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Collect failed services
+      ansible.builtin.command: systemctl --failed --no-legend
+      register: failed_services
+      changed_when: false
+      failed_when: false
+
+    - name: Collect package manager audit
+      ansible.builtin.command: dpkg --audit
+      register: dpkg_audit
+      changed_when: false
+      failed_when: false
+
+    - name: Report recovery diagnostics
+      ansible.builtin.debug:
+        msg:
+          failed_services: "{{ failed_services.stdout_lines }}"
+          package_audit: "{{ dpkg_audit.stdout_lines }}"

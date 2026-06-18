@@ -8,8 +8,15 @@
       ansible.builtin.apt:
         update_cache: true
 
-    - name: Upgrade packages
+    - name: Ensure unattended upgrades is installed
       ansible.builtin.apt:
-        upgrade: dist
-        autoremove: true
+        name: unattended-upgrades
+        state: present
 
+    - name: Apply updates from configured security origins
+      ansible.builtin.command:
+        cmd: unattended-upgrade --verbose
+      register: security_upgrade
+      changed_when: >-
+        'Packages that will be upgraded:' in security_upgrade.stdout or
+        'Packages that were successfully auto-removed:' in security_upgrade.stdout

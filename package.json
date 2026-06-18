@@ -7,10 +7,12 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build --workspace @ai-sysadm/shared && npm run build --workspace @ai-sysadm/api && npm run build --workspace @ai-sysadm/web",
-    "dev": "npm run dev --workspace @ai-sysadm/api",
-    "dev:api": "npm run dev --workspace @ai-sysadm/api",
+    "build": "python3 -m compileall -q apps/api/sysadmin_api && npm run build --workspace @ai-sysadm/shared && npm run build --workspace @ai-sysadm/web",
+    "dev": "npm run dev:api",
+    "dev:api": "python3 -m uvicorn sysadmin_api.main:app --app-dir apps/api --reload --port 4000",
     "dev:web": "npm run dev --workspace @ai-sysadm/web",
-    "test": "npm run test --workspaces"
+    "test": "npm run test:js && npm run test:api",
+    "test:js": "npm run test --workspaces",
+    "test:api": "python3 -m pytest apps/api/tests"
   }
 }

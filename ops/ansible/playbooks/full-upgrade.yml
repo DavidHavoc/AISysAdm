@@ -1,0 +1,15 @@
+---
+- name: Apply all available package updates
+  hosts: all
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Refresh apt metadata
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Apply distribution upgrades
+      ansible.builtin.apt:
+        upgrade: dist
+        autoremove: true
+        autoclean: true

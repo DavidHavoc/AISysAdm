@@ -14,7 +14,12 @@ class Settings(BaseSettings):
 
     api_host: str = "0.0.0.0"
     api_port: int = 4000
-    cors_origins: List[str] = Field(default_factory=lambda: ["http://localhost:5173"])
+    cors_origins: List[str] = Field(
+        default_factory=lambda: [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ]
+    )
 
     database_url: Optional[str] = None
     redis_url: Optional[str] = None

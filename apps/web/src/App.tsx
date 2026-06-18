@@ -1,5 +1,11 @@
 import { useEffect, useState } from "react";
-import type { Finding, Host, HostInput, Remediation } from "@ai-sysadm/shared";
+import type {
+  Finding,
+  Host,
+  HostInput,
+  PatchCampaign,
+  Remediation
+} from "@ai-sysadm/shared";
 import { api } from "./api.js";
 
 const defaultHost: HostInput = {
@@ -9,7 +15,16 @@ const defaultHost: HostInput = {
   username: "ubuntu",
   distroFamily: "debian",
   environment: "production",
-  tags: ["web", "critical"]
+  tags: ["web", "critical"],
+  criticality: "high",
+  availabilityClass: "high_availability",
+  patchPolicy: {
+    updateMode: "orchestrator_decides",
+    executionTiming: "immediate",
+    maxBatchSize: 5,
+    canaryCount: 1,
+    rebootPolicy: "if_required"
+  }
 };
 
 export function App() {
@@ -17,16 +32,20 @@ export function App() {
   const [selectedHostId, setSelectedHostId] = useState<string>("");
   const [findings, setFindings] = useState<Finding[]>([]);
   const [remediations, setRemediations] = useState<Remediation[]>([]);
+  const [campaigns, setCampaigns] = useState<PatchCampaign[]>([]);
   const [error, setError] = useState<string>("");
+  const [busy, setBusy] = useState<string>("");
 
   async function refresh() {
     try {
-      const [nextHosts, nextRemediations] = await Promise.all([
+      const [nextHosts, nextRemediations, nextCampaigns] = await Promise.all([
         api.listHosts(),
-        api.listRemediations()
+        api.listRemediations(),
+        api.listCampaigns()
       ]);
       setHosts(nextHosts);
       setRemediations(nextRemediations);
+      setCampaigns(nextCampaigns);
 
       if (nextHosts.length > 0) {
         const hostId = selectedHostId || nextHosts[0].id;
@@ -43,30 +62,60 @@ export function App() {
   }, []);
 
   async function addHost() {
-    await api.createHost(defaultHost);
-    await refresh();
+    await act("add-host", async () => {
+      await api.createHost({
+        ...defaultHost,
+        name: hosts.length ? `prod-web-${hosts.length + 1}` : defaultHost.name,
+        address: `10.0.0.${25 + hosts.length}`
+      });
+    });
   }
 
   async function runScan(hostId: string) {
-    await api.runScan(hostId);
-    const nextFindings = await api.listFindings(hostId);
-    setFindings(nextFindings);
-    await refresh();
+    await act(`scan-${hostId}`, async () => {
+      await api.runScan(hostId);
+      setFindings(await api.listFindings(hostId));
+    });
   }
 
   async function approve(remediationId: string) {
-    await api.approveRemediation(remediationId);
-    await refresh();
+    await act(`approve-${remediationId}`, () => api.approveRemediation(remediationId));
   }
 
   async function reject(remediationId: string) {
-    await api.rejectRemediation(remediationId);
-    await refresh();
+    await act(`reject-${remediationId}`, () => api.rejectRemediation(remediationId));
   }
 
   async function chooseHost(hostId: string) {
     setSelectedHostId(hostId);
     setFindings(await api.listFindings(hostId));
+  }
+
+  async function createCampaign() {
+    await act("create-campaign", () =>
+      api.createCampaign("Production patch wave", hosts.map((host) => host.id))
+    );
+  }
+
+  async function approveCampaign(campaignId: string) {
+    await act(`campaign-${campaignId}`, () => api.approveCampaign(campaignId));
+  }
+
+  async function rejectCampaign(campaignId: string) {
+    await act(`campaign-${campaignId}`, () => api.rejectCampaign(campaignId));
+  }
+
+  async function act(key: string, action: () => Promise<unknown>) {
+    setBusy(key);
+    setError("");
+    try {
+      await action();
+      await refresh();
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Unknown operation error");
+    } finally {
+      setBusy("");
+    }
   }
 
   const selectedHost = hosts.find((host) => host.id === selectedHostId);
@@ -78,21 +127,48 @@ export function App() {
           <p className="eyebrow">Internal Ops Console</p>
           <h1>AI Linux Sysadmin</h1>
           <p className="hero-copy">
-            Inspect Ubuntu and Debian VMs over SSH, synthesize findings with specialist agents,
-            and gate every remediation behind human approval.
+            Two economy specialists inspect Linux state and logs. A capable orchestrator explains
+            the risk, chooses patch scope, predicts reboot impact, and waits for your approval.
           </p>
         </div>
-        <button className="primary-button" onClick={() => void addHost()}>
+        <button className="primary-button" disabled={busy === "add-host"} onClick={() => void addHost()}>
           Add Demo Host
         </button>
       </section>
 
       {error ? <section className="error-banner">{error}</section> : null}
 
+      <section className="agent-strip" aria-label="AI agent architecture">
+        <div>
+          <span className="agent-number">01</span>
+          <strong>Orchestrator AI</strong>
+          <small>Capable model / plans, explains, gates</small>
+        </div>
+        <div>
+          <span className="agent-number">02</span>
+          <strong>Linux State AI</strong>
+          <small>Economy model / packages, kernel, capacity</small>
+        </div>
+        <div>
+          <span className="agent-number">03</span>
+          <strong>Log Analysis AI</strong>
+          <small>Economy model / services, auth, boot events</small>
+        </div>
+      </section>
+
       <section className="dashboard-grid">
         <article className="panel">
           <div className="panel-header">
             <h2>Fleet</h2>
+            {hosts.length ? (
+              <button
+                className="secondary-button"
+                disabled={busy === "create-campaign"}
+                onClick={() => void createCampaign()}
+              >
+                Plan Fleet Wave
+              </button>
+            ) : null}
           </div>
           <div className="panel-body fleet-list">
             {hosts.length === 0 ? <p>No hosts registered yet.</p> : null}
@@ -104,8 +180,31 @@ export function App() {
               >
                 <strong>{host.name}</strong>
                 <span>{host.address}</span>
-                <span>{host.environment}</span>
+                <span>{host.environment} / {host.availabilityClass.replace("_", " ")}</span>
               </button>
+            ))}
+            {campaigns.map((campaign) => (
+              <div key={campaign.id} className="campaign-card">
+                <span className="eyebrow">Fleet Campaign</span>
+                <strong>{campaign.name}</strong>
+                <span>{campaign.status} / batch {campaign.batchSize} / {campaign.totalBatches} wave(s)</span>
+                <div className="action-row">
+                  <button
+                    className="primary-button"
+                    disabled={campaign.status !== "pending_approval" || busy === `campaign-${campaign.id}`}
+                    onClick={() => void approveCampaign(campaign.id)}
+                  >
+                    Approve Wave
+                  </button>
+                  <button
+                    className="secondary-button"
+                    disabled={campaign.status !== "pending_approval"}
+                    onClick={() => void rejectCampaign(campaign.id)}
+                  >
+                    Reject
+                  </button>
+                </div>
+              </div>
             ))}
           </div>
         </article>
@@ -115,7 +214,7 @@ export function App() {
             <h2>Host Findings</h2>
             {selectedHost ? (
               <button className="secondary-button" onClick={() => void runScan(selectedHost.id)}>
-                Run Scan
+                {busy === `scan-${selectedHost.id}` ? "Scanning..." : "Run Scan"}
               </button>
             ) : null}
           </div>
@@ -128,7 +227,7 @@ export function App() {
                   <span>{finding.sourceAgent}</span>
                 </div>
                 <h3>{finding.summary}</h3>
-                <p>{finding.category}</p>
+                <p>{finding.explanation}</p>
                 {finding.evidence.map((item) => (
                   <blockquote key={item.citation}>
                     {item.excerpt}
@@ -153,16 +252,44 @@ export function App() {
                   <span>{remediation.approvalState}</span>
                   <span>{remediation.executionState}</span>
                 </div>
-                <h3>{remediation.actionType}</h3>
-                <p>Playbook: {remediation.playbook}</p>
-                <p>Snapshot hook: {remediation.preChangeProtection.status}</p>
+                <h3>{remediation.title}</h3>
+                <p>{remediation.aiDecision.explanation}</p>
+                <dl className="plan-grid">
+                  <div>
+                    <dt>Update scope</dt>
+                    <dd>{remediation.updateScope}</dd>
+                  </div>
+                  <div>
+                    <dt>Reboot</dt>
+                    <dd>{remediation.rebootAssessment.status.replaceAll("_", " ")}</dd>
+                  </div>
+                  <div>
+                    <dt>Downtime</dt>
+                    <dd>~{remediation.rebootAssessment.estimatedDowntimeMinutes} min</dd>
+                  </div>
+                  <div>
+                    <dt>Rollout</dt>
+                    <dd>{remediation.rolloutPolicy.strategy.replaceAll("_", " ")}</dd>
+                  </div>
+                </dl>
+                <p className="reboot-note">{remediation.rebootAssessment.rationale}</p>
+                <p className="approval-note">
+                  Approval covers package changes and a reboot only if the post-patch check requires it.
+                </p>
+                <div className="model-list">
+                  {remediation.aiDecision.agentAssignments.map((agent) => (
+                    <span key={agent.name}>
+                      {agent.name.replaceAll("_", " ")}: {agent.provider}/{agent.model} ({agent.modelTier})
+                    </span>
+                  ))}
+                </div>
                 <div className="action-row">
                   <button
                     className="primary-button"
-                    disabled={remediation.approvalState !== "pending"}
+                    disabled={remediation.approvalState !== "pending" || busy === `approve-${remediation.id}`}
                     onClick={() => void approve(remediation.id)}
                   >
-                    Approve
+                    Approve Patch + Reboot
                   </button>
                   <button
                     className="secondary-button"
@@ -172,7 +299,14 @@ export function App() {
                     Reject
                   </button>
                 </div>
-                {remediation.result ? <pre>{remediation.result.output}</pre> : null}
+                {remediation.result ? (
+                  <div className="phase-list">
+                    <strong>{remediation.result.summary}</strong>
+                    {remediation.result.phases.map((phase) => (
+                      <span key={phase.name}>{phase.state} / {phase.summary}</span>
+                    ))}
+                  </div>
+                ) : null}
               </div>
             ))}
           </div>
@@ -181,4 +315,3 @@ export function App() {
     </main>
   );
 }
-

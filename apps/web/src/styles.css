@@ -69,6 +69,37 @@ button {
   grid-template-columns: 1fr 1.2fr 1.1fr;
 }
 
+.agent-strip {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  overflow: hidden;
+  margin-bottom: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.agent-strip > div {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 12px;
+  padding: 16px 18px;
+  background: rgba(10, 13, 18, 0.88);
+}
+
+.agent-strip small {
+  grid-column: 2;
+  color: rgba(246, 241, 232, 0.58);
+}
+
+.agent-number {
+  grid-row: 1 / 3;
+  color: #f1ab67;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 1.2rem;
+}
+
 .panel {
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 20px;
@@ -101,11 +132,17 @@ button {
 
 .host-card,
 .finding-card,
-.remediation-card {
+.remediation-card,
+.campaign-card {
   padding: 16px;
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.campaign-card {
+  display: grid;
+  gap: 7px;
 }
 
 .host-card {
@@ -223,6 +260,53 @@ pre {
   color: #ffd9d9;
 }
 
+.plan-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+  margin: 14px 0;
+}
+
+.plan-grid div {
+  padding: 10px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.plan-grid dt {
+  color: rgba(246, 241, 232, 0.55);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.plan-grid dd {
+  margin: 3px 0 0;
+  font-weight: 700;
+}
+
+.reboot-note,
+.approval-note {
+  padding: 10px 12px;
+  border-left: 3px solid #f1ab67;
+  background: rgba(241, 171, 103, 0.08);
+}
+
+.approval-note {
+  border-color: #6fceff;
+  background: rgba(111, 206, 255, 0.08);
+}
+
+.model-list,
+.phase-list {
+  display: grid;
+  gap: 5px;
+  margin-top: 12px;
+  color: rgba(246, 241, 232, 0.66);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.76rem;
+}
+
 @media (max-width: 1080px) {
   .dashboard-grid {
     grid-template-columns: 1fr;
@@ -232,5 +316,8 @@ pre {
     flex-direction: column;
     align-items: start;
   }
-}
 
+  .agent-strip {
+    grid-template-columns: 1fr;
+  }
+}

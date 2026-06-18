@@ -34,6 +34,10 @@ class Repository(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def list_scans(self, host_id: str) -> List[ScanJob]:
+        raise NotImplementedError
+
+    @abstractmethod
     def save_findings(self, findings: List[Finding]) -> List[Finding]:
         raise NotImplementedError
 
@@ -93,6 +97,9 @@ class InMemoryRepository(Repository):
 
     def get_scan(self, scan_id: str) -> Optional[ScanJob]:
         return self._scans.get(scan_id)
+
+    def list_scans(self, host_id: str) -> List[ScanJob]:
+        return [item for item in self._scans.values() if item.host_id == host_id]
 
     def save_findings(self, findings: List[Finding]) -> List[Finding]:
         with self._lock:
@@ -205,6 +212,9 @@ class SqlRepository(Repository):
 
     def get_scan(self, scan_id: str) -> Optional[ScanJob]:
         return self._get("scan", scan_id)
+
+    def list_scans(self, host_id: str) -> List[ScanJob]:
+        return self._list("scan", host_id)
 
     def save_findings(self, findings: List[Finding]) -> List[Finding]:
         for finding in findings:

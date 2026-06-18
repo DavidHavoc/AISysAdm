@@ -11,5 +11,4 @@
 
     - name: Print reboot state
       ansible.builtin.debug:
-        msg: "reboot_required={{ reboot_required.stat.exists }}"
-
+        msg: "reboot_required={{ reboot_required.stat.exists | lower }}"

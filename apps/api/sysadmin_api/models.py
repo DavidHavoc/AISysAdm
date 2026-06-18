@@ -20,6 +20,7 @@ class ApiModel(BaseModel):
     model_config = ConfigDict(
         alias_generator=to_camel,
         populate_by_name=True,
+        protected_namespaces=(),
         use_enum_values=True,
     )
 
@@ -154,6 +155,7 @@ class RecommendedAction(ApiModel):
 class Finding(ApiModel):
     id: str
     host_id: str
+    scan_id: Optional[str] = None
     source_agent: AgentName
     category: str
     severity: Severity

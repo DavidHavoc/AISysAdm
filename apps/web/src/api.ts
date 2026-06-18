@@ -1,4 +1,11 @@
-import type { Finding, Host, HostInput, Remediation, ScanJob } from "@ai-sysadm/shared";
+import type {
+  Finding,
+  Host,
+  HostInput,
+  PatchCampaign,
+  Remediation,
+  ScanJob
+} from "@ai-sysadm/shared";
 
 const baseUrl = import.meta.env.VITE_API_URL ?? "http://localhost:4000";
 
@@ -24,6 +31,12 @@ export const api = {
   listFindings: (hostId: string) => request<Finding[]>(`/hosts/${hostId}/findings`),
   listRemediations: () => request<Remediation[]>("/remediations"),
   approveRemediation: (remediationId: string) => request<Remediation>(`/remediations/${remediationId}/approve`, { method: "POST" }),
-  rejectRemediation: (remediationId: string) => request<Remediation>(`/remediations/${remediationId}/reject`, { method: "POST" })
+  rejectRemediation: (remediationId: string) => request<Remediation>(`/remediations/${remediationId}/reject`, { method: "POST" }),
+  listCampaigns: () => request<PatchCampaign[]>("/campaigns"),
+  createCampaign: (name: string, hostIds: string[]) => request<PatchCampaign>("/campaigns", {
+    method: "POST",
+    body: JSON.stringify({ name, hostIds })
+  }),
+  approveCampaign: (campaignId: string) => request<PatchCampaign>(`/campaigns/${campaignId}/approve`, { method: "POST" }),
+  rejectCampaign: (campaignId: string) => request<PatchCampaign>(`/campaigns/${campaignId}/reject`, { method: "POST" })
 };
-

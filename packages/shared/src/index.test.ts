@@ -1,47 +1,61 @@
 import { describe, expect, it } from "vitest";
-import { hostSnapshotSchema, remediationSchema } from "./index.js";
+import { hostInputSchema, remediationSchema } from "./index.js";
 
 describe("shared schemas", () => {
-  it("accepts a valid host snapshot", () => {
-    const parsed = hostSnapshotSchema.parse({
-      hostId: "host-1",
-      collectedAt: new Date().toISOString(),
-      commands: {
-        uptime: "up 10 hours"
-      },
-      packageSummary: {
-        pendingSecurityUpdates: 3,
-        pendingPackageUpdates: 9,
-        rebootRequired: false
-      },
-      serviceSummary: {
-        failedUnits: ["nginx.service"]
-      },
-      systemSummary: {
-        uptimeHours: 10,
-        loadAverage: [0.1, 0.2, 0.3],
-        diskUsagePercent: 44,
-        memoryUsagePercent: 58,
-        kernelVersion: "6.8.0"
-      },
-      logs: {
-        journal: "sample",
-        auth: "sample",
-        aptHistory: "sample"
-      }
+  it("applies safe host patch policy defaults", () => {
+    const parsed = hostInputSchema.parse({
+      name: "web-1",
+      address: "10.0.0.10",
+      port: 22,
+      username: "ubuntu",
+      distroFamily: "debian",
+      environment: "production",
+      tags: ["web"],
+      criticality: "high",
+      availabilityClass: "high_availability",
+      patchPolicy: {}
     });
 
-    expect(parsed.packageSummary.pendingSecurityUpdates).toBe(3);
+    expect(parsed.patchPolicy.updateMode).toBe("orchestrator_decides");
+    expect(parsed.patchPolicy.rebootPolicy).toBe("if_required");
   });
 
-  it("requires deferred snapshot metadata in remediations", () => {
+  it("requires patch and reboot impact in remediation plans", () => {
+    const now = new Date().toISOString();
     const parsed = remediationSchema.parse({
       id: "rem-1",
       hostId: "host-1",
-      actionType: "security_upgrade",
-      playbook: "security-upgrade.yml",
-      inputs: {},
+      title: "Patch web-1",
+      actionType: "package_upgrade",
+      updateScope: "all",
       riskLevel: "high",
+      aiDecision: {
+        updateScope: "all",
+        riskLevel: "high",
+        explanation: "Apply and validate the complete package set.",
+        agentAssignments: []
+      },
+      rebootAssessment: {
+        status: "required_after_patch",
+        rationale: "A kernel update is selected.",
+        evidence: [],
+        estimatedDowntimeMinutes: 5,
+        approvedIfRequired: false
+      },
+      rolloutPolicy: {
+        strategy: "one_at_a_time",
+        batchSize: 1,
+        canaryCount: 1,
+        rationale: "High availability host."
+      },
+      failurePolicy: {
+        stopRemainingHosts: true,
+        notifyOperator: true,
+        attemptPredefinedRecovery: true,
+        recoveryActions: []
+      },
+      executionTiming: "immediate",
+      approvalScope: "patch_and_reboot_if_required",
       approvalState: "pending",
       executionState: "not_started",
       result: null,
@@ -49,10 +63,11 @@ describe("shared schemas", () => {
         supported: false,
         status: "deferred"
       },
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
+      createdAt: now,
+      updatedAt: now
     });
 
-    expect(parsed.preChangeProtection.status).toBe("deferred");
+    expect(parsed.rebootAssessment.status).toBe("required_after_patch");
+    expect(parsed.rolloutPolicy.batchSize).toBe(1);
   });
 });
