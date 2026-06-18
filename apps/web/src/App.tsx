@@ -4,7 +4,8 @@ import type {
   Host,
   HostInput,
   PatchCampaign,
-  Remediation
+  Remediation,
+  User
 } from "@ai-sysadm/shared";
 import { api } from "./api.js";
 
@@ -28,6 +29,10 @@ const defaultHost: HostInput = {
 };
 
 export function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [username, setUsername] = useState("admin");
+  const [password, setPassword] = useState("");
   const [hosts, setHosts] = useState<Host[]>([]);
   const [selectedHostId, setSelectedHostId] = useState<string>("");
   const [findings, setFindings] = useState<Finding[]>([]);
@@ -58,8 +63,39 @@ export function App() {
   }
 
   useEffect(() => {
-    void refresh();
+    void api.me()
+      .then(async (currentUser) => {
+        setUser(currentUser);
+        await refresh();
+      })
+      .catch(() => undefined)
+      .finally(() => setAuthChecked(true));
   }, []);
+
+  async function login(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy("login");
+    setError("");
+    try {
+      const currentUser = await api.login(username, password);
+      setUser(currentUser);
+      setPassword("");
+      await refresh();
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Login failed");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function logout() {
+    await api.logout();
+    setUser(null);
+    setHosts([]);
+    setFindings([]);
+    setRemediations([]);
+    setCampaigns([]);
+  }
 
   async function addHost() {
     await act("add-host", async () => {
@@ -78,8 +114,24 @@ export function App() {
     });
   }
 
-  async function approve(remediationId: string) {
-    await act(`approve-${remediationId}`, () => api.approveRemediation(remediationId));
+  async function approve(remediation: Remediation) {
+    const host = hosts.find((item) => item.id === remediation.hostId);
+    if (!host) {
+      setError("The remediation host is no longer available.");
+      return;
+    }
+    const confirmation = window.prompt(
+      `Type ${host.name} to approve this exact plan.`
+    );
+    if (confirmation === null) return;
+    await act(`approve-${remediation.id}`, () =>
+      api.approveRemediation(
+        remediation.id,
+        remediation.planVersion,
+        remediation.planHash,
+        confirmation
+      )
+    );
   }
 
   async function reject(remediationId: string) {
@@ -97,14 +149,6 @@ export function App() {
     );
   }
 
-  async function approveCampaign(campaignId: string) {
-    await act(`campaign-${campaignId}`, () => api.approveCampaign(campaignId));
-  }
-
-  async function rejectCampaign(campaignId: string) {
-    await act(`campaign-${campaignId}`, () => api.rejectCampaign(campaignId));
-  }
-
   async function act(key: string, action: () => Promise<unknown>) {
     setBusy(key);
     setError("");
@@ -120,6 +164,42 @@ export function App() {
 
   const selectedHost = hosts.find((host) => host.id === selectedHostId);
 
+  if (!authChecked) {
+    return <main className="app-shell"><p>Loading operator session...</p></main>;
+  }
+
+  if (!user) {
+    return (
+      <main className="app-shell">
+        <section className="hero">
+          <div>
+            <p className="eyebrow">Internal Ops Console</p>
+            <h1>AI Linux Sysadmin</h1>
+            <p className="hero-copy">Sign in to inspect hosts and approve exact remediation plans.</p>
+          </div>
+        </section>
+        {error ? <section className="error-banner">{error}</section> : null}
+        <form className="panel panel-body" onSubmit={(event) => void login(event)}>
+          <label>
+            Username
+            <input value={username} onChange={(event) => setUsername(event.target.value)} />
+          </label>
+          <label>
+            Password
+            <input
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+            />
+          </label>
+          <button className="primary-button" disabled={busy === "login"} type="submit">
+            {busy === "login" ? "Signing in..." : "Sign in"}
+          </button>
+        </form>
+      </main>
+    );
+  }
+
   return (
     <main className="app-shell">
       <section className="hero">
@@ -131,9 +211,14 @@ export function App() {
             the risk, chooses patch scope, predicts reboot impact, and waits for your approval.
           </p>
         </div>
-        <button className="primary-button" disabled={busy === "add-host"} onClick={() => void addHost()}>
-          Add Demo Host
-        </button>
+        <div className="action-row">
+          <button className="primary-button" disabled={busy === "add-host"} onClick={() => void addHost()}>
+            Add Demo Host
+          </button>
+          <button className="secondary-button" onClick={() => void logout()}>
+            Sign out
+          </button>
+        </div>
       </section>
 
       {error ? <section className="error-banner">{error}</section> : null}
@@ -188,22 +273,10 @@ export function App() {
                 <span className="eyebrow">Fleet Campaign</span>
                 <strong>{campaign.name}</strong>
                 <span>{campaign.status} / batch {campaign.batchSize} / {campaign.totalBatches} wave(s)</span>
-                <div className="action-row">
-                  <button
-                    className="primary-button"
-                    disabled={campaign.status !== "pending_approval" || busy === `campaign-${campaign.id}`}
-                    onClick={() => void approveCampaign(campaign.id)}
-                  >
-                    Approve Wave
-                  </button>
-                  <button
-                    className="secondary-button"
-                    disabled={campaign.status !== "pending_approval"}
-                    onClick={() => void rejectCampaign(campaign.id)}
-                  >
-                    Reject
-                  </button>
-                </div>
+                <small>
+                  Campaign execution is deferred until every remediation can carry
+                  its own plan hash and hostname confirmation.
+                </small>
               </div>
             ))}
           </div>
@@ -287,7 +360,7 @@ export function App() {
                   <button
                     className="primary-button"
                     disabled={remediation.approvalState !== "pending" || busy === `approve-${remediation.id}`}
-                    onClick={() => void approve(remediation.id)}
+                    onClick={() => void approve(remediation)}
                   >
                     Approve Patch + Reboot
                   </button>

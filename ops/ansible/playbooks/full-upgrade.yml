@@ -4,11 +4,11 @@
   become: true
   gather_facts: true
   tasks:
-    - name: Refresh apt metadata
+    - name: "[patch.packages.refresh] Refresh apt metadata"
       ansible.builtin.apt:
         update_cache: true
 
-    - name: Apply distribution upgrades
+    - name: "[patch.packages.full_upgrade] Apply distribution upgrades"
       ansible.builtin.apt:
         upgrade: dist
         autoremove: true

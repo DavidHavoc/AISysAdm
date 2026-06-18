@@ -4,7 +4,7 @@
   become: true
   gather_facts: false
   tasks:
-    - name: Reboot and wait for SSH to return
+    - name: "[reboot.execution.restart] Reboot and wait for SSH to return"
       ansible.builtin.reboot:
         msg: "Reboot approved by the AI Sysadmin operator"
         connect_timeout: 10

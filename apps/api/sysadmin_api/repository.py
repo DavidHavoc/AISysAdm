@@ -1,243 +1,880 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from datetime import datetime
 from threading import RLock
-from typing import Dict, List, Optional, Type, TypeVar
+from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar
 
-from sqlalchemy import JSON, Column, DateTime, MetaData, String, Table, create_engine, delete, select
-from sqlalchemy.engine import Engine
+from sqlalchemy import delete, func, select, text
 
-from .models import Finding, Host, PatchCampaign, Remediation, ScanJob, utc_now
+from .database import (
+    AgentMessageRecord,
+    AgentRunRecord,
+    AlertRecord,
+    AuditRecord,
+    Base,
+    CampaignRecord,
+    CredentialRecord,
+    FindingRecord,
+    HostRecord,
+    JobRecord,
+    LogEventRecord,
+    RemediationRecord,
+    ScanRecord,
+    ScheduleRecord,
+    SessionRecord,
+    SnapshotRecord,
+    UserRecord,
+    create_session_factory,
+)
+from .models import (
+    AgentMessage,
+    AgentRun,
+    Alert,
+    AuditEvent,
+    DurableJob,
+    Finding,
+    Host,
+    HostSchedule,
+    HostSnapshot,
+    PatchCampaign,
+    Remediation,
+    ScanJob,
+    SshCredential,
+    StructuredLogEvent,
+    User,
+)
 
-ModelT = TypeVar("ModelT", Host, Finding, Remediation, ScanJob, PatchCampaign)
+ModelT = TypeVar("ModelT")
 
 
-class Repository(ABC):
-    @abstractmethod
+class Repository:
     def list_hosts(self) -> List[Host]:
         raise NotImplementedError
 
-    @abstractmethod
     def save_host(self, host: Host) -> Host:
         raise NotImplementedError
 
-    @abstractmethod
     def get_host(self, host_id: str) -> Optional[Host]:
         raise NotImplementedError
 
-    @abstractmethod
-    def save_scan(self, scan: ScanJob) -> ScanJob:
+    def healthcheck(self) -> bool:
         raise NotImplementedError
 
-    @abstractmethod
-    def get_scan(self, scan_id: str) -> Optional[ScanJob]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def list_scans(self, host_id: str) -> List[ScanJob]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def save_findings(self, findings: List[Finding]) -> List[Finding]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def list_findings(self, host_id: str) -> List[Finding]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def save_remediation(self, remediation: Remediation) -> Remediation:
-        raise NotImplementedError
-
-    @abstractmethod
-    def list_remediations(self) -> List[Remediation]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_remediation(self, remediation_id: str) -> Optional[Remediation]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def save_campaign(self, campaign: PatchCampaign) -> PatchCampaign:
-        raise NotImplementedError
-
-    @abstractmethod
-    def list_campaigns(self) -> List[PatchCampaign]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_campaign(self, campaign_id: str) -> Optional[PatchCampaign]:
+    def claim_job(self, job_id: str, started_at: datetime) -> Optional[DurableJob]:
         raise NotImplementedError
 
 
 class InMemoryRepository(Repository):
     def __init__(self) -> None:
-        self._hosts: Dict[str, Host] = {}
-        self._scans: Dict[str, ScanJob] = {}
-        self._findings: Dict[str, Finding] = {}
-        self._remediations: Dict[str, Remediation] = {}
-        self._campaigns: Dict[str, PatchCampaign] = {}
+        self.hosts: Dict[str, Host] = {}
+        self.credentials: Dict[str, Tuple[SshCredential, bytes, bytes]] = {}
+        self.schedules: Dict[str, HostSchedule] = {}
+        self.snapshots: Dict[str, HostSnapshot] = {}
+        self.scans: Dict[str, ScanJob] = {}
+        self.agent_runs: Dict[str, AgentRun] = {}
+        self.agent_messages: Dict[str, AgentMessage] = {}
+        self.findings: Dict[str, Finding] = {}
+        self.remediations: Dict[str, Remediation] = {}
+        self.campaigns: Dict[str, PatchCampaign] = {}
+        self.jobs: Dict[str, DurableJob] = {}
+        self.logs: Dict[str, StructuredLogEvent] = {}
+        self.alerts: Dict[str, Alert] = {}
+        self.audits: Dict[str, AuditEvent] = {}
+        self.users: Dict[str, Tuple[User, str]] = {}
+        self.sessions: Dict[str, Dict[str, Any]] = {}
         self._lock = RLock()
 
     def list_hosts(self) -> List[Host]:
-        return list(self._hosts.values())
+        return list(self.hosts.values())
 
     def save_host(self, host: Host) -> Host:
-        with self._lock:
-            self._hosts[host.id] = host
+        self.hosts[host.id] = host
         return host
 
     def get_host(self, host_id: str) -> Optional[Host]:
-        return self._hosts.get(host_id)
+        return self.hosts.get(host_id)
+
+    def healthcheck(self) -> bool:
+        return True
+
+    def delete_host(self, host_id: str) -> None:
+        self.hosts.pop(host_id, None)
+
+    def save_credential(
+        self,
+        credential: SshCredential,
+        encrypted_key: bytes,
+        nonce: bytes,
+    ) -> SshCredential:
+        self.credentials[credential.id] = (credential, encrypted_key, nonce)
+        return credential
+
+    def list_credentials(self) -> List[SshCredential]:
+        return [item[0] for item in self.credentials.values()]
+
+    def get_credential_record(
+        self,
+        credential_id: str,
+    ) -> Optional[Tuple[SshCredential, bytes, bytes]]:
+        return self.credentials.get(credential_id)
+
+    def delete_credential(self, credential_id: str) -> None:
+        self.credentials.pop(credential_id, None)
+
+    def save_schedule(self, schedule: HostSchedule) -> HostSchedule:
+        self.schedules[schedule.host_id] = schedule
+        return schedule
+
+    def get_schedule(self, host_id: str) -> Optional[HostSchedule]:
+        return self.schedules.get(host_id)
+
+    def list_schedules(self) -> List[HostSchedule]:
+        return list(self.schedules.values())
+
+    def delete_schedule(self, host_id: str) -> None:
+        self.schedules.pop(host_id, None)
+
+    def list_due_schedules(self, now: datetime) -> List[HostSchedule]:
+        return [
+            item
+            for item in self.schedules.values()
+            if item.enabled and item.next_run_at and item.next_run_at <= now
+        ]
+
+    def save_snapshot(self, snapshot: HostSnapshot) -> HostSnapshot:
+        self.snapshots[snapshot.id] = snapshot
+        return snapshot
+
+    def get_snapshot(self, snapshot_id: str) -> Optional[HostSnapshot]:
+        return self.snapshots.get(snapshot_id)
 
     def save_scan(self, scan: ScanJob) -> ScanJob:
-        with self._lock:
-            self._scans[scan.id] = scan
+        self.scans[scan.id] = scan
         return scan
 
     def get_scan(self, scan_id: str) -> Optional[ScanJob]:
-        return self._scans.get(scan_id)
+        return self.scans.get(scan_id)
 
-    def list_scans(self, host_id: str) -> List[ScanJob]:
-        return [item for item in self._scans.values() if item.host_id == host_id]
+    def list_scans(self, host_id: Optional[str] = None) -> List[ScanJob]:
+        items = list(self.scans.values())
+        return [item for item in items if item.host_id == host_id] if host_id else items
+
+    def save_agent_runs(self, runs: List[AgentRun]) -> List[AgentRun]:
+        for item in runs:
+            self.agent_runs[item.id] = item
+        return runs
+
+    def list_agent_runs(self, scan_id: Optional[str] = None) -> List[AgentRun]:
+        items = list(self.agent_runs.values())
+        return [item for item in items if item.scan_id == scan_id] if scan_id else items
+
+    def save_agent_messages(self, messages: List[AgentMessage]) -> List[AgentMessage]:
+        for item in messages:
+            self.agent_messages[item.id] = item
+        return messages
+
+    def list_agent_messages(self, scan_id: str) -> List[AgentMessage]:
+        return [item for item in self.agent_messages.values() if item.scan_id == scan_id]
 
     def save_findings(self, findings: List[Finding]) -> List[Finding]:
-        with self._lock:
-            for finding in findings:
-                self._findings[finding.id] = finding
+        for item in findings:
+            self.findings[item.id] = item
         return findings
 
-    def list_findings(self, host_id: str) -> List[Finding]:
-        return [item for item in self._findings.values() if item.host_id == host_id]
+    def list_findings(self, host_id: Optional[str] = None) -> List[Finding]:
+        items = list(self.findings.values())
+        return [item for item in items if item.host_id == host_id] if host_id else items
 
     def save_remediation(self, remediation: Remediation) -> Remediation:
-        with self._lock:
-            self._remediations[remediation.id] = remediation
+        self.remediations[remediation.id] = remediation
         return remediation
 
     def list_remediations(self) -> List[Remediation]:
-        return list(self._remediations.values())
+        return list(self.remediations.values())
 
     def get_remediation(self, remediation_id: str) -> Optional[Remediation]:
-        return self._remediations.get(remediation_id)
+        return self.remediations.get(remediation_id)
 
     def save_campaign(self, campaign: PatchCampaign) -> PatchCampaign:
-        with self._lock:
-            self._campaigns[campaign.id] = campaign
+        self.campaigns[campaign.id] = campaign
         return campaign
 
     def list_campaigns(self) -> List[PatchCampaign]:
-        return list(self._campaigns.values())
+        return list(self.campaigns.values())
 
     def get_campaign(self, campaign_id: str) -> Optional[PatchCampaign]:
-        return self._campaigns.get(campaign_id)
+        return self.campaigns.get(campaign_id)
 
+    def save_job(self, job: DurableJob) -> DurableJob:
+        self.jobs[job.id] = job
+        return job
 
-metadata = MetaData()
-records = Table(
-    "control_plane_records",
-    metadata,
-    Column("kind", String(32), primary_key=True),
-    Column("id", String(96), primary_key=True),
-    Column("host_id", String(96), nullable=True, index=True),
-    Column("payload", JSON, nullable=False),
-    Column("updated_at", DateTime(timezone=True), nullable=False),
-)
+    def claim_job(self, job_id: str, started_at: datetime) -> Optional[DurableJob]:
+        with self._lock:
+            job = self.jobs.get(job_id)
+            if not job or job.status != "queued":
+                return None
+            job.status = "running"
+            job.started_at = job.started_at or started_at
+            job.attempts += 1
+            job.updated_at = started_at
+            self.jobs[job.id] = job
+            return job
+
+    def get_job(self, job_id: str) -> Optional[DurableJob]:
+        return self.jobs.get(job_id)
+
+    def get_job_by_idempotency(self, key: str) -> Optional[DurableJob]:
+        return next((item for item in self.jobs.values() if item.idempotency_key == key), None)
+
+    def list_jobs(self) -> List[DurableJob]:
+        return list(self.jobs.values())
+
+    def host_has_active_scan(self, host_id: str) -> bool:
+        return any(
+            item.host_id == host_id
+            and item.job_type == "scan"
+            and item.status in ("queued", "running")
+            for item in self.jobs.values()
+        )
+
+    def save_log_events(
+        self,
+        events: List[StructuredLogEvent],
+    ) -> List[StructuredLogEvent]:
+        for item in events:
+            self.logs[item.id] = item
+        return events
+
+    def get_log_event(self, event_id: str) -> Optional[StructuredLogEvent]:
+        return self.logs.get(event_id)
+
+    def list_log_events(
+        self,
+        filters: Dict[str, Any],
+        page: int,
+        page_size: int,
+    ) -> Tuple[List[StructuredLogEvent], int]:
+        items = list(self.logs.values())
+        for key, value in filters.items():
+            if value is not None:
+                items = [item for item in items if getattr(item, key) == value]
+        items.sort(key=lambda item: item.timestamp, reverse=True)
+        start = (page - 1) * page_size
+        return items[start : start + page_size], len(items)
+
+    def purge_logs_before(self, cutoff: datetime) -> int:
+        ids = [item.id for item in self.logs.values() if item.timestamp < cutoff]
+        for event_id in ids:
+            self.logs.pop(event_id, None)
+        return len(ids)
+
+    def save_alert(self, alert: Alert) -> Alert:
+        self.alerts[alert.id] = alert
+        return alert
+
+    def list_alerts(self) -> List[Alert]:
+        return list(self.alerts.values())
+
+    def get_alert(self, alert_id: str) -> Optional[Alert]:
+        return self.alerts.get(alert_id)
+
+    def save_audit(self, event: AuditEvent) -> AuditEvent:
+        self.audits[event.id] = event
+        return event
+
+    def list_audits(self) -> List[AuditEvent]:
+        return list(self.audits.values())
+
+    def save_user(self, user: User, password_hash: str) -> User:
+        self.users[user.id] = (user, password_hash)
+        return user
+
+    def get_user_by_username(self, username: str) -> Optional[Tuple[User, str]]:
+        return next(
+            (item for item in self.users.values() if item[0].username == username),
+            None,
+        )
+
+    def get_user(self, user_id: str) -> Optional[User]:
+        item = self.users.get(user_id)
+        return item[0] if item else None
+
+    def save_session(
+        self,
+        session_id: str,
+        user_id: str,
+        token_hash: str,
+        csrf_hash: str,
+        expires_at: datetime,
+        created_at: datetime,
+    ) -> None:
+        self.sessions[token_hash] = {
+            "id": session_id,
+            "user_id": user_id,
+            "csrf_hash": csrf_hash,
+            "expires_at": expires_at,
+            "created_at": created_at,
+        }
+
+    def get_session(self, token_hash: str) -> Optional[Dict[str, Any]]:
+        return self.sessions.get(token_hash)
+
+    def delete_session(self, token_hash: str) -> None:
+        self.sessions.pop(token_hash, None)
 
 
 class SqlRepository(Repository):
-    """JSON-backed SQL repository for PostgreSQL and local integration testing."""
+    def __init__(self, database_url: str, create_schema: bool = False) -> None:
+        self.engine, self.Session = create_session_factory(database_url)
+        if create_schema:
+            Base.metadata.create_all(self.engine)
 
-    model_by_kind: Dict[str, Type[ModelT]] = {
-        "host": Host,
-        "scan": ScanJob,
-        "finding": Finding,
-        "remediation": Remediation,
-        "campaign": PatchCampaign,
-    }
-
-    def __init__(self, database_url: str) -> None:
-        self.engine: Engine = create_engine(database_url)
-        metadata.create_all(self.engine)
-
-    def _save(self, kind: str, item: ModelT, host_id: Optional[str] = None) -> ModelT:
-        payload = item.model_dump(mode="json", by_alias=False)
-        with self.engine.begin() as connection:
-            connection.execute(
-                delete(records).where(records.c.kind == kind, records.c.id == item.id)
-            )
-            connection.execute(
-                records.insert().values(
-                    kind=kind,
-                    id=item.id,
-                    host_id=host_id,
-                    payload=payload,
-                    updated_at=utc_now(),
-                )
-            )
-        return item
-
-    def _get(self, kind: str, item_id: str) -> Optional[ModelT]:
-        with self.engine.connect() as connection:
-            row = connection.execute(
-                select(records.c.payload).where(
-                    records.c.kind == kind,
-                    records.c.id == item_id,
-                )
-            ).first()
-        if not row:
-            return None
-        return self.model_by_kind[kind].model_validate(row.payload)
-
-    def _list(self, kind: str, host_id: Optional[str] = None) -> List[ModelT]:
-        statement = select(records.c.payload).where(records.c.kind == kind)
-        if host_id is not None:
-            statement = statement.where(records.c.host_id == host_id)
-        with self.engine.connect() as connection:
-            rows = connection.execute(statement).all()
-        model = self.model_by_kind[kind]
-        return [model.model_validate(row.payload) for row in rows]
+    @staticmethod
+    def _payload(item) -> dict:
+        return item.model_dump(mode="json", by_alias=False)
 
     def list_hosts(self) -> List[Host]:
-        return self._list("host")
+        return self._list_payload(HostRecord, Host)
+
+    def healthcheck(self) -> bool:
+        with self.engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        return True
 
     def save_host(self, host: Host) -> Host:
-        return self._save("host", host)
+        with self.Session.begin() as session:
+            record = session.get(HostRecord, host.id)
+            values = {
+                "name": host.name,
+                "address": host.address,
+                "environment": host.environment,
+                "payload": self._payload(host),
+                "created_at": host.created_at,
+                "updated_at": host.updated_at,
+            }
+            if record:
+                for key, value in values.items():
+                    setattr(record, key, value)
+            else:
+                session.add(HostRecord(id=host.id, **values))
+        return host
 
     def get_host(self, host_id: str) -> Optional[Host]:
-        return self._get("host", host_id)
+        return self._get_payload(HostRecord, Host, host_id)
+
+    def delete_host(self, host_id: str) -> None:
+        with self.Session.begin() as session:
+            session.execute(delete(HostRecord).where(HostRecord.id == host_id))
+
+    def save_credential(
+        self,
+        credential: SshCredential,
+        encrypted_key: bytes,
+        nonce: bytes,
+    ) -> SshCredential:
+        with self.Session.begin() as session:
+            record = session.get(CredentialRecord, credential.id)
+            values = {
+                "name": credential.name,
+                "fingerprint": credential.fingerprint,
+                "encrypted_key": encrypted_key,
+                "nonce": nonce,
+                "created_at": credential.created_at,
+                "last_used_at": credential.last_used_at,
+            }
+            if record:
+                for key, value in values.items():
+                    setattr(record, key, value)
+            else:
+                session.add(CredentialRecord(id=credential.id, **values))
+        return credential
+
+    def list_credentials(self) -> List[SshCredential]:
+        with self.Session() as session:
+            rows = session.scalars(select(CredentialRecord)).all()
+        return [
+            SshCredential(
+                id=row.id,
+                name=row.name,
+                fingerprint=row.fingerprint,
+                created_at=row.created_at,
+                last_used_at=row.last_used_at,
+            )
+            for row in rows
+        ]
+
+    def get_credential_record(
+        self,
+        credential_id: str,
+    ) -> Optional[Tuple[SshCredential, bytes, bytes]]:
+        with self.Session() as session:
+            row = session.get(CredentialRecord, credential_id)
+            if not row:
+                return None
+            return (
+                SshCredential(
+                    id=row.id,
+                    name=row.name,
+                    fingerprint=row.fingerprint,
+                    created_at=row.created_at,
+                    last_used_at=row.last_used_at,
+                ),
+                row.encrypted_key,
+                row.nonce,
+            )
+
+    def delete_credential(self, credential_id: str) -> None:
+        with self.Session.begin() as session:
+            session.execute(
+                delete(CredentialRecord).where(CredentialRecord.id == credential_id)
+            )
+
+    def save_schedule(self, schedule: HostSchedule) -> HostSchedule:
+        return self._upsert_payload(
+            ScheduleRecord,
+            schedule,
+            {
+                "host_id": schedule.host_id,
+                "enabled": schedule.enabled,
+                "next_run_at": schedule.next_run_at,
+                "created_at": schedule.created_at,
+                "updated_at": schedule.updated_at,
+            },
+        )
+
+    def get_schedule(self, host_id: str) -> Optional[HostSchedule]:
+        with self.Session() as session:
+            row = session.scalar(
+                select(ScheduleRecord).where(ScheduleRecord.host_id == host_id)
+            )
+        return HostSchedule.model_validate(row.payload) if row else None
+
+    def list_schedules(self) -> List[HostSchedule]:
+        return self._list_payload(ScheduleRecord, HostSchedule)
+
+    def delete_schedule(self, host_id: str) -> None:
+        with self.Session.begin() as session:
+            session.execute(
+                delete(ScheduleRecord).where(ScheduleRecord.host_id == host_id)
+            )
+
+    def list_due_schedules(self, now: datetime) -> List[HostSchedule]:
+        with self.Session() as session:
+            rows = session.scalars(
+                select(ScheduleRecord).where(
+                    ScheduleRecord.enabled.is_(True),
+                    ScheduleRecord.next_run_at <= now,
+                )
+            ).all()
+        return [HostSchedule.model_validate(row.payload) for row in rows]
+
+    def save_snapshot(self, snapshot: HostSnapshot) -> HostSnapshot:
+        return self._upsert_payload(
+            SnapshotRecord,
+            snapshot,
+            {
+                "host_id": snapshot.host_id,
+                "snapshot_hash": snapshot.snapshot_hash,
+                "collected_at": snapshot.collected_at,
+            },
+        )
+
+    def get_snapshot(self, snapshot_id: str) -> Optional[HostSnapshot]:
+        return self._get_payload(SnapshotRecord, HostSnapshot, snapshot_id)
 
     def save_scan(self, scan: ScanJob) -> ScanJob:
-        return self._save("scan", scan, scan.host_id)
+        return self._upsert_payload(
+            ScanRecord,
+            scan,
+            {
+                "host_id": scan.host_id,
+                "status": scan.status,
+                "trigger": scan.trigger,
+                "created_at": scan.created_at,
+                "updated_at": scan.updated_at,
+            },
+        )
 
     def get_scan(self, scan_id: str) -> Optional[ScanJob]:
-        return self._get("scan", scan_id)
+        return self._get_payload(ScanRecord, ScanJob, scan_id)
 
-    def list_scans(self, host_id: str) -> List[ScanJob]:
-        return self._list("scan", host_id)
+    def list_scans(self, host_id: Optional[str] = None) -> List[ScanJob]:
+        statement = select(ScanRecord)
+        if host_id:
+            statement = statement.where(ScanRecord.host_id == host_id)
+        with self.Session() as session:
+            rows = session.scalars(statement).all()
+        return [ScanJob.model_validate(row.payload) for row in rows]
+
+    def save_agent_runs(self, runs: List[AgentRun]) -> List[AgentRun]:
+        for item in runs:
+            self._upsert_payload(
+                AgentRunRecord,
+                item,
+                {
+                    "scan_id": item.scan_id,
+                    "agent_name": str(item.agent.name),
+                    "provider": item.agent.provider,
+                    "model": item.agent.model,
+                    "contract_hash": item.agent.contract_hash,
+                    "input_hash": item.input_hash,
+                    "created_at": item.created_at,
+                },
+            )
+        return runs
+
+    def list_agent_runs(self, scan_id: Optional[str] = None) -> List[AgentRun]:
+        statement = select(AgentRunRecord)
+        if scan_id:
+            statement = statement.where(AgentRunRecord.scan_id == scan_id)
+        with self.Session() as session:
+            rows = session.scalars(statement).all()
+        return [AgentRun.model_validate(row.payload) for row in rows]
+
+    def save_agent_messages(self, messages: List[AgentMessage]) -> List[AgentMessage]:
+        for item in messages:
+            self._upsert_payload(
+                AgentMessageRecord,
+                item,
+                {
+                    "scan_id": item.scan_id,
+                    "from_agent": str(item.from_agent),
+                    "to_agent": str(item.to_agent),
+                    "response": item.response,
+                    "created_at": item.created_at,
+                },
+            )
+        return messages
+
+    def list_agent_messages(self, scan_id: str) -> List[AgentMessage]:
+        with self.Session() as session:
+            rows = session.scalars(
+                select(AgentMessageRecord).where(
+                    AgentMessageRecord.scan_id == scan_id
+                )
+            ).all()
+        return [AgentMessage.model_validate(row.payload) for row in rows]
 
     def save_findings(self, findings: List[Finding]) -> List[Finding]:
-        for finding in findings:
-            self._save("finding", finding, finding.host_id)
+        for item in findings:
+            self._upsert_payload(
+                FindingRecord,
+                item,
+                {
+                    "host_id": item.host_id,
+                    "scan_id": item.scan_id or "",
+                    "severity": str(item.severity),
+                    "source_agent": str(item.source_agent),
+                    "created_at": item.created_at,
+                },
+            )
         return findings
 
-    def list_findings(self, host_id: str) -> List[Finding]:
-        return self._list("finding", host_id)
+    def list_findings(self, host_id: Optional[str] = None) -> List[Finding]:
+        statement = select(FindingRecord)
+        if host_id:
+            statement = statement.where(FindingRecord.host_id == host_id)
+        with self.Session() as session:
+            rows = session.scalars(statement).all()
+        return [Finding.model_validate(row.payload) for row in rows]
 
     def save_remediation(self, remediation: Remediation) -> Remediation:
-        return self._save("remediation", remediation, remediation.host_id)
+        return self._upsert_payload(
+            RemediationRecord,
+            remediation,
+            {
+                "host_id": remediation.host_id,
+                "scan_id": remediation.scan_id,
+                "approval_state": remediation.approval_state,
+                "execution_state": remediation.execution_state,
+                "plan_hash": remediation.plan_hash,
+                "created_at": remediation.created_at,
+                "updated_at": remediation.updated_at,
+            },
+        )
 
     def list_remediations(self) -> List[Remediation]:
-        return self._list("remediation")
+        return self._list_payload(RemediationRecord, Remediation)
 
     def get_remediation(self, remediation_id: str) -> Optional[Remediation]:
-        return self._get("remediation", remediation_id)
+        return self._get_payload(RemediationRecord, Remediation, remediation_id)
 
     def save_campaign(self, campaign: PatchCampaign) -> PatchCampaign:
-        return self._save("campaign", campaign)
+        return self._upsert_payload(
+            CampaignRecord,
+            campaign,
+            {
+                "status": campaign.status,
+                "created_at": campaign.created_at,
+                "updated_at": campaign.updated_at,
+            },
+        )
 
     def list_campaigns(self) -> List[PatchCampaign]:
-        return self._list("campaign")
+        return self._list_payload(CampaignRecord, PatchCampaign)
 
     def get_campaign(self, campaign_id: str) -> Optional[PatchCampaign]:
-        return self._get("campaign", campaign_id)
+        return self._get_payload(CampaignRecord, PatchCampaign, campaign_id)
+
+    def save_job(self, job: DurableJob) -> DurableJob:
+        return self._upsert_payload(
+            JobRecord,
+            job,
+            {
+                "job_type": job.job_type,
+                "status": job.status,
+                "host_id": job.host_id,
+                "idempotency_key": job.idempotency_key,
+                "created_at": job.created_at,
+                "updated_at": job.updated_at,
+            },
+        )
+
+    def claim_job(self, job_id: str, started_at: datetime) -> Optional[DurableJob]:
+        with self.Session.begin() as session:
+            row = session.scalar(
+                select(JobRecord)
+                .where(JobRecord.id == job_id)
+                .with_for_update()
+            )
+            if not row:
+                return None
+            job = DurableJob.model_validate(row.payload)
+            if job.status != "queued":
+                return None
+            job.status = "running"
+            job.started_at = job.started_at or started_at
+            job.attempts += 1
+            job.updated_at = started_at
+            row.status = job.status
+            row.updated_at = job.updated_at
+            row.payload = self._payload(job)
+            return job
+
+    def get_job(self, job_id: str) -> Optional[DurableJob]:
+        return self._get_payload(JobRecord, DurableJob, job_id)
+
+    def get_job_by_idempotency(self, key: str) -> Optional[DurableJob]:
+        with self.Session() as session:
+            row = session.scalar(
+                select(JobRecord).where(JobRecord.idempotency_key == key)
+            )
+        return DurableJob.model_validate(row.payload) if row else None
+
+    def list_jobs(self) -> List[DurableJob]:
+        return self._list_payload(JobRecord, DurableJob)
+
+    def host_has_active_scan(self, host_id: str) -> bool:
+        with self.Session() as session:
+            count = session.scalar(
+                select(func.count())
+                .select_from(JobRecord)
+                .where(
+                    JobRecord.host_id == host_id,
+                    JobRecord.job_type == "scan",
+                    JobRecord.status.in_(["queued", "running"]),
+                )
+            )
+        return bool(count)
+
+    def save_log_events(
+        self,
+        events: List[StructuredLogEvent],
+    ) -> List[StructuredLogEvent]:
+        for item in events:
+            self._upsert_payload(
+                LogEventRecord,
+                item,
+                {
+                    "timestamp": item.timestamp,
+                    "host_id": item.host_id,
+                    "job_id": item.job_id,
+                    "scan_id": item.scan_id,
+                    "remediation_id": item.remediation_id,
+                    "agent_run_id": item.agent_run_id,
+                    "severity": str(item.severity),
+                    "source": item.source,
+                    "phase_id": item.phase_id,
+                    "task_id": item.task_id,
+                },
+            )
+        return events
+
+    def get_log_event(self, event_id: str) -> Optional[StructuredLogEvent]:
+        return self._get_payload(LogEventRecord, StructuredLogEvent, event_id)
+
+    def list_log_events(
+        self,
+        filters: Dict[str, Any],
+        page: int,
+        page_size: int,
+    ) -> Tuple[List[StructuredLogEvent], int]:
+        statement = select(LogEventRecord)
+        count_statement = select(func.count()).select_from(LogEventRecord)
+        column_map = {
+            "host_id": LogEventRecord.host_id,
+            "job_id": LogEventRecord.job_id,
+            "scan_id": LogEventRecord.scan_id,
+            "remediation_id": LogEventRecord.remediation_id,
+            "agent_run_id": LogEventRecord.agent_run_id,
+            "severity": LogEventRecord.severity,
+            "source": LogEventRecord.source,
+            "phase_id": LogEventRecord.phase_id,
+            "task_id": LogEventRecord.task_id,
+        }
+        for key, value in filters.items():
+            if value is not None and key in column_map:
+                statement = statement.where(column_map[key] == value)
+                count_statement = count_statement.where(column_map[key] == value)
+        statement = (
+            statement.order_by(LogEventRecord.timestamp.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        with self.Session() as session:
+            rows = session.scalars(statement).all()
+            total = int(session.scalar(count_statement) or 0)
+        return [StructuredLogEvent.model_validate(row.payload) for row in rows], total
+
+    def purge_logs_before(self, cutoff: datetime) -> int:
+        with self.Session.begin() as session:
+            result = session.execute(
+                delete(LogEventRecord).where(LogEventRecord.timestamp < cutoff)
+            )
+        return int(result.rowcount or 0)
+
+    def save_alert(self, alert: Alert) -> Alert:
+        return self._upsert_payload(
+            AlertRecord,
+            alert,
+            {
+                "severity": str(alert.severity),
+                "acknowledged": alert.acknowledged,
+                "host_id": alert.host_id,
+                "created_at": alert.created_at,
+            },
+        )
+
+    def list_alerts(self) -> List[Alert]:
+        return self._list_payload(AlertRecord, Alert)
+
+    def get_alert(self, alert_id: str) -> Optional[Alert]:
+        return self._get_payload(AlertRecord, Alert, alert_id)
+
+    def save_audit(self, event: AuditEvent) -> AuditEvent:
+        return self._upsert_payload(
+            AuditRecord,
+            event,
+            {
+                "actor": event.actor,
+                "action": event.action,
+                "target_type": event.target_type,
+                "target_id": event.target_id,
+                "created_at": event.created_at,
+            },
+        )
+
+    def list_audits(self) -> List[AuditEvent]:
+        return self._list_payload(AuditRecord, AuditEvent)
+
+    def save_user(self, user: User, password_hash: str) -> User:
+        with self.Session.begin() as session:
+            record = session.get(UserRecord, user.id)
+            values = {
+                "username": user.username,
+                "password_hash": password_hash,
+                "created_at": user.created_at,
+            }
+            if record:
+                for key, value in values.items():
+                    setattr(record, key, value)
+            else:
+                session.add(UserRecord(id=user.id, **values))
+        return user
+
+    def get_user_by_username(self, username: str) -> Optional[Tuple[User, str]]:
+        with self.Session() as session:
+            row = session.scalar(
+                select(UserRecord).where(UserRecord.username == username)
+            )
+        if not row:
+            return None
+        return (
+            User(id=row.id, username=row.username, created_at=row.created_at),
+            row.password_hash,
+        )
+
+    def get_user(self, user_id: str) -> Optional[User]:
+        with self.Session() as session:
+            row = session.get(UserRecord, user_id)
+        return User(id=row.id, username=row.username, created_at=row.created_at) if row else None
+
+    def save_session(
+        self,
+        session_id: str,
+        user_id: str,
+        token_hash: str,
+        csrf_hash: str,
+        expires_at: datetime,
+        created_at: datetime,
+    ) -> None:
+        with self.Session.begin() as session:
+            session.add(
+                SessionRecord(
+                    id=session_id,
+                    user_id=user_id,
+                    token_hash=token_hash,
+                    csrf_hash=csrf_hash,
+                    expires_at=expires_at,
+                    created_at=created_at,
+                )
+            )
+
+    def get_session(self, token_hash: str) -> Optional[Dict[str, Any]]:
+        with self.Session() as session:
+            row = session.scalar(
+                select(SessionRecord).where(SessionRecord.token_hash == token_hash)
+            )
+        if not row:
+            return None
+        return {
+            "id": row.id,
+            "user_id": row.user_id,
+            "csrf_hash": row.csrf_hash,
+            "expires_at": row.expires_at,
+            "created_at": row.created_at,
+        }
+
+    def delete_session(self, token_hash: str) -> None:
+        with self.Session.begin() as session:
+            session.execute(
+                delete(SessionRecord).where(SessionRecord.token_hash == token_hash)
+            )
+
+    def _get_payload(
+        self,
+        record_type,
+        model_type: Type[ModelT],
+        item_id: str,
+    ) -> Optional[ModelT]:
+        with self.Session() as session:
+            row = session.get(record_type, item_id)
+        return model_type.model_validate(row.payload) if row else None
+
+    def _list_payload(self, record_type, model_type: Type[ModelT]) -> List[ModelT]:
+        with self.Session() as session:
+            rows = session.scalars(select(record_type)).all()
+        return [model_type.model_validate(row.payload) for row in rows]
+
+    def _upsert_payload(self, record_type, item: ModelT, values: Dict[str, Any]) -> ModelT:
+        with self.Session.begin() as session:
+            row = session.get(record_type, item.id)
+            payload = self._payload(item)
+            if row:
+                row.payload = payload
+                for key, value in values.items():
+                    setattr(row, key, value)
+            else:
+                session.add(record_type(id=item.id, payload=payload, **values))
+        return item

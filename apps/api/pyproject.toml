@@ -8,6 +8,11 @@ version = "0.2.0"
 description = "Approval-gated AI control plane for Linux patching"
 requires-python = ">=3.9"
 dependencies = [
+  "alembic>=1.14,<2",
+  "argon2-cffi>=23.1,<26",
+  "celery>=5.4,<6",
+  "cryptography>=43,<46",
+  "croniter>=3.0,<7",
   "fastapi>=0.115,<1",
   "httpx>=0.27,<1",
   "pydantic>=2.9,<3",

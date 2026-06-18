@@ -1,0 +1,5 @@
+---
+ai_diagnostic_since: "24 hours ago"
+ai_max_journal_lines: 1000
+ai_max_history_lines: 1000
+ai_max_listening_ports: 500

@@ -4,16 +4,16 @@
   become: true
   gather_facts: true
   tasks:
-    - name: Refresh apt metadata
+    - name: "[patch.packages.refresh] Refresh apt metadata"
       ansible.builtin.apt:
         update_cache: true
 
-    - name: Ensure unattended upgrades is installed
+    - name: "[patch.packages.unattended_dependency] Ensure unattended upgrades is installed"
       ansible.builtin.apt:
         name: unattended-upgrades
         state: present
 
-    - name: Apply updates from configured security origins
+    - name: "[patch.packages.security_upgrade] Apply updates from configured security origins"
       ansible.builtin.command:
         cmd: unattended-upgrade --verbose
       register: security_upgrade

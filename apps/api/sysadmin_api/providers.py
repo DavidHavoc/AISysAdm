@@ -15,6 +15,13 @@ class ProviderError(RuntimeError):
     pass
 
 
+@dataclass
+class ProviderCompletion:
+    data: Dict[str, Any]
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
 class AiProvider(ABC):
     name: str
 
@@ -23,8 +30,17 @@ class AiProvider(ABC):
         self.model = model
         self.api_key = api_key
 
+    @property
+    def external(self) -> bool:
+        return self.name in ("openai", "anthropic")
+
     @abstractmethod
-    async def complete_json(self, system: str, prompt: str) -> Dict[str, Any]:
+    async def complete_json(
+        self,
+        system: str,
+        prompt: str,
+        max_output_tokens: int,
+    ) -> ProviderCompletion:
         raise NotImplementedError
 
     @staticmethod
@@ -44,11 +60,17 @@ class AiProvider(ABC):
 class OpenAiProvider(AiProvider):
     name = "openai"
 
-    async def complete_json(self, system: str, prompt: str) -> Dict[str, Any]:
+    async def complete_json(
+        self,
+        system: str,
+        prompt: str,
+        max_output_tokens: int,
+    ) -> ProviderCompletion:
         headers = {"Authorization": "Bearer %s" % self.api_key}
         body = {
             "model": self.model,
             "response_format": {"type": "json_object"},
+            "max_tokens": max_output_tokens,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
@@ -61,21 +83,32 @@ class OpenAiProvider(AiProvider):
                 json=body,
             )
             response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        return self.parse_json(content)
+        payload = response.json()
+        usage = payload.get("usage", {})
+        content = payload["choices"][0]["message"]["content"]
+        return ProviderCompletion(
+            data=self.parse_json(content),
+            prompt_tokens=int(usage.get("prompt_tokens", 0)),
+            completion_tokens=int(usage.get("completion_tokens", 0)),
+        )
 
 
 class AnthropicProvider(AiProvider):
     name = "anthropic"
 
-    async def complete_json(self, system: str, prompt: str) -> Dict[str, Any]:
+    async def complete_json(
+        self,
+        system: str,
+        prompt: str,
+        max_output_tokens: int,
+    ) -> ProviderCompletion:
         headers = {
             "x-api-key": str(self.api_key),
             "anthropic-version": "2023-06-01",
         }
         body = {
             "model": self.model,
-            "max_tokens": 1200,
+            "max_tokens": max_output_tokens,
             "system": system,
             "messages": [{"role": "user", "content": prompt}],
         }
@@ -86,18 +119,29 @@ class AnthropicProvider(AiProvider):
                 json=body,
             )
             response.raise_for_status()
-        content = response.json()["content"][0]["text"]
-        return self.parse_json(content)
+        payload = response.json()
+        usage = payload.get("usage", {})
+        return ProviderCompletion(
+            data=self.parse_json(payload["content"][0]["text"]),
+            prompt_tokens=int(usage.get("input_tokens", 0)),
+            completion_tokens=int(usage.get("output_tokens", 0)),
+        )
 
 
 class OllamaProvider(AiProvider):
     name = "ollama"
 
-    async def complete_json(self, system: str, prompt: str) -> Dict[str, Any]:
+    async def complete_json(
+        self,
+        system: str,
+        prompt: str,
+        max_output_tokens: int,
+    ) -> ProviderCompletion:
         body = {
             "model": self.model,
             "format": "json",
             "stream": False,
+            "options": {"num_predict": max_output_tokens},
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
@@ -106,7 +150,12 @@ class OllamaProvider(AiProvider):
         async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post("%s/api/chat" % self.base_url, json=body)
             response.raise_for_status()
-        return self.parse_json(response.json()["message"]["content"])
+        payload = response.json()
+        return ProviderCompletion(
+            data=self.parse_json(payload["message"]["content"]),
+            prompt_tokens=int(payload.get("prompt_eval_count", 0)),
+            completion_tokens=int(payload.get("eval_count", 0)),
+        )
 
 
 @dataclass
@@ -121,7 +170,12 @@ class ModelRouter:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    def route(self, agent: AgentName) -> RoutedModel:
+    def route(
+        self,
+        agent: AgentName,
+        contract_version: int = 1,
+        contract_hash: str = "",
+    ) -> RoutedModel:
         tier = ModelTier.CAPABLE if agent == AgentName.ORCHESTRATOR else ModelTier.ECONOMY
         requested = (
             self.settings.ai_orchestrator_provider
@@ -133,12 +187,26 @@ class ModelRouter:
             provider = self._build(provider_name, tier)
             if provider:
                 return RoutedModel(
-                    identity=self._identity(agent, tier, provider.name, provider.model),
+                    identity=self._identity(
+                        agent,
+                        tier,
+                        provider.name,
+                        provider.model,
+                        contract_version,
+                        contract_hash,
+                    ),
                     provider=provider,
                 )
 
         return RoutedModel(
-            identity=self._identity(agent, ModelTier.DETERMINISTIC, "local", "policy-engine"),
+            identity=self._identity(
+                agent,
+                ModelTier.DETERMINISTIC,
+                "local",
+                "policy-engine",
+                contract_version,
+                contract_hash,
+            ),
             provider=None,
         )
 
@@ -176,26 +244,27 @@ class ModelRouter:
         tier: ModelTier,
         provider: str,
         model: str,
+        contract_version: int,
+        contract_hash: str,
     ) -> AgentIdentity:
         responsibilities = {
             AgentName.ORCHESTRATOR: (
-                "Synthesizes specialist reports, chooses patch scope, explains risk, "
-                "and creates an approval-gated rollout plan."
+                "Synthesizes verified specialist reports and creates approval-gated plans."
             ),
             AgentName.LOG_ANALYST: (
-                "Reads system, authentication, kernel, boot, service, and package logs."
+                "Analyzes bounded structured system, authentication, kernel, boot, and package logs."
             ),
             AgentName.LINUX_STATE_ANALYST: (
-                "Reads packages, resources, services, kernel state, and reboot indicators."
+                "Analyzes packages, resources, services, kernel state, and reboot indicators."
             ),
         }
         reason = (
             "Capable model selected for cross-agent decisions and operator explanations."
             if tier == ModelTier.CAPABLE
-            else "Economy model selected for bounded specialist analysis."
+            else "Economy model selected for bounded specialist analysis and review."
         )
         if tier == ModelTier.DETERMINISTIC:
-            reason = "No configured AI provider was available, so policy-safe local analysis was used."
+            reason = "No configured provider was available; verified local policy was used."
         return AgentIdentity(
             name=agent,
             responsibility=responsibilities[agent],
@@ -203,4 +272,6 @@ class ModelRouter:
             provider=provider,
             model=model,
             selection_reason=reason,
+            contract_version=contract_version,
+            contract_hash=contract_hash,
         )

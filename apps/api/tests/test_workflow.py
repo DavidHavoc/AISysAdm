@@ -1,15 +1,25 @@
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
 
+from sysadmin_api.agents import (
+    validate_orchestrator_response,
+    validate_review_response,
+)
+from sysadmin_api.collector import DemoCollector
+from sysadmin_api.executor import SimulatedExecutor
 from sysadmin_api.models import (
     AgentName,
-    CampaignRequest,
-    ExecutionResult,
+    ApprovalRequest,
+    Finding,
     HostInput,
     MaintenanceWindow,
     PatchPolicy,
+    RecommendedAction,
     ScanRequest,
+    Severity,
+    utc_now,
 )
 from sysadmin_api.providers import ModelRouter
 
@@ -31,25 +41,36 @@ def host_input(name: str = "web-1", **overrides) -> HostInput:
     return HostInput(**values)
 
 
+async def completed_scan(service, host):
+    job = service.create_scan_job(ScanRequest(host_id=host.id))
+    completed = await service.process_scan(job.id)
+    return service.get_scan(completed.scan_id)
+
+
+def approval_for(host, remediation):
+    return ApprovalRequest(
+        plan_version=remediation.plan_version,
+        plan_hash=remediation.plan_hash,
+        hostname_confirmation=host.name,
+    )
+
+
 @pytest.mark.asyncio
 async def test_three_agents_and_reboot_are_explicit(service):
     host = service.create_host(host_input())
-    scan = await service.run_scan(ScanRequest(host_id=host.id))
+    scan = await completed_scan(service, host)
 
     assert scan.status == "completed"
     assert {report.agent.name for report in scan.agent_reports} == {
         "log_analyst",
         "linux_state_analyst",
     }
-    assert all(report.agent.model_tier == "deterministic" for report in scan.agent_reports)
+    assert all(
+        report.agent.model_tier == "deterministic"
+        for report in scan.agent_reports
+    )
 
     remediation = service.list_remediations()[0]
-    assignments = {item.name: item for item in remediation.ai_decision.agent_assignments}
-    assert set(assignments) == {
-        "orchestrator",
-        "log_analyst",
-        "linux_state_analyst",
-    }
     assert remediation.update_scope == "all"
     assert remediation.reboot_assessment.status == "required_after_patch"
     assert remediation.reboot_assessment.approved_if_required is False
@@ -58,18 +79,70 @@ async def test_three_agents_and_reboot_are_explicit(service):
 
 
 @pytest.mark.asyncio
-async def test_approval_covers_patch_and_required_reboot(service):
+async def test_approval_binds_job_to_exact_plan_and_required_reboot(service):
     host = service.create_host(host_input())
-    scan = await service.run_scan(ScanRequest(host_id=host.id))
-    remediation_id = scan.remediation_ids[0]
+    scan = await completed_scan(service, host)
+    remediation = service.repository.get_remediation(scan.remediation_ids[0])
 
-    approved = await service.approve_remediation(remediation_id)
+    job = service.prepare_remediation_job(
+        remediation.id,
+        approval_for(host, remediation),
+        "admin",
+    )
+    completed = await service.process_remediation(job.id)
+    approved = service.repository.get_remediation(remediation.id)
 
-    assert approved.approval_scope == "patch_and_reboot_if_required"
-    assert approved.reboot_assessment.approved_if_required is True
+    assert job.approved_plan_version == remediation.plan_version
+    assert job.approved_plan_hash == remediation.plan_hash
+    assert job.approval_scope == "patch_and_reboot_if_required"
+    assert completed.status == "completed"
     assert approved.execution_state == "succeeded"
-    assert approved.result is not None
     assert approved.result.reboot_performed is True
+
+
+@pytest.mark.asyncio
+async def test_changed_plan_is_blocked_before_executor_runs(service):
+    host = service.create_host(host_input())
+    scan = await completed_scan(service, host)
+    remediation = service.repository.get_remediation(scan.remediation_ids[0])
+    job = service.prepare_remediation_job(
+        remediation.id,
+        approval_for(host, remediation),
+        "admin",
+    )
+    remediation.update_scope = "security"
+    service.repository.save_remediation(remediation)
+
+    result = await service.process_remediation(job.id)
+
+    assert result.status == "failed"
+    assert "content changed" in result.error
+    assert service.repository.get_remediation(remediation.id).execution_state == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_worker_delivery_executes_scan_once(service):
+    class CountingCollector(DemoCollector):
+        calls = 0
+
+        async def collect(self, host, job_id="", scan_id=""):
+            self.calls += 1
+            await asyncio.sleep(0)
+            return await super().collect(host, job_id, scan_id)
+
+    collector = CountingCollector()
+    service.collector = collector
+    host = service.create_host(host_input())
+    job = service.create_scan_job(ScanRequest(host_id=host.id))
+
+    first, second = await asyncio.gather(
+        service.process_scan(job.id),
+        service.process_scan(job.id),
+    )
+
+    assert collector.calls == 1
+    assert {first.status, second.status} <= {"running", "completed"}
+    assert service.get_job(job.id).status == "completed"
 
 
 @pytest.mark.asyncio
@@ -84,80 +157,138 @@ async def test_maintenance_window_waits_after_approval(service):
         ),
     )
     host = service.create_host(host_input(patch_policy=policy))
-    scan = await service.run_scan(ScanRequest(host_id=host.id))
+    scan = await completed_scan(service, host)
+    remediation = service.repository.get_remediation(scan.remediation_ids[0])
 
-    approved = await service.approve_remediation(
-        scan.remediation_ids[0],
-        now=datetime(2026, 6, 18, 12, 0, tzinfo=timezone.utc),
+    job = service.prepare_remediation_job(
+        remediation.id,
+        approval_for(host, remediation),
+        "admin",
     )
 
-    assert approved.approval_state == "approved"
-    assert approved.execution_state == "waiting_for_window"
-    assert approved.result is None
+    assert job.status == "scheduled"
+    assert service.repository.get_remediation(remediation.id).execution_state == (
+        "waiting_for_window"
+    )
 
 
 @pytest.mark.asyncio
 async def test_reboot_never_policy_blocks_uncertain_or_required_reboot(service):
-    policy = PatchPolicy(reboot_policy="never")
-    host = service.create_host(host_input(patch_policy=policy))
-    scan = await service.run_scan(ScanRequest(host_id=host.id))
+    host = service.create_host(
+        host_input(patch_policy=PatchPolicy(reboot_policy="never"))
+    )
+    scan = await completed_scan(service, host)
+    remediation = service.repository.get_remediation(scan.remediation_ids[0])
 
     with pytest.raises(ValueError, match="forbids reboot risk"):
-        await service.approve_remediation(scan.remediation_ids[0])
+        service.prepare_remediation_job(
+            remediation.id,
+            approval_for(host, remediation),
+            "admin",
+        )
 
-    blocked = service.repository.get_remediation(scan.remediation_ids[0])
-    assert blocked is not None
+    blocked = service.repository.get_remediation(remediation.id)
     assert blocked.approval_state == "manual_review"
     assert blocked.execution_state == "blocked"
 
 
-class FailingExecutor:
-    async def execute(self, host, remediation):
-        return ExecutionResult(
-            success=False,
-            summary="Validation failed",
-            changed=True,
-            reboot_performed=False,
-            phases=[],
-            failure_actions_taken=[
-                "remaining campaign hosts stopped",
-                "operator notification recorded",
-                "predefined recovery diagnostics attempted",
-            ],
-        )
-
-
 @pytest.mark.asyncio
-async def test_campaign_halts_remaining_hosts_on_failure(service):
-    first = service.create_host(host_input("web-1"))
-    second = service.create_host(
-        host_input("web-2", address="10.0.0.11")
-    )
-    campaign = await service.create_campaign(
-        CampaignRequest(name="Production wave", host_ids=[first.id, second.id])
-    )
-    service.executor = FailingExecutor()
-
-    result = await service.approve_campaign(campaign.id)
-
-    assert result.batch_size == 1
-    assert result.status == "halted"
-    assert result.current_batch == 1
-    second_remediation = service.repository.get_remediation(result.remediation_ids[1])
-    assert second_remediation is not None
-    assert second_remediation.execution_state == "not_started"
-
-
-@pytest.mark.asyncio
-async def test_host_findings_show_only_the_latest_scan(service):
+async def test_scheduled_scan_can_propose_but_never_approve(service):
     host = service.create_host(host_input())
-    first = await service.run_scan(ScanRequest(host_id=host.id))
-    second = await service.run_scan(ScanRequest(host_id=host.id))
+    job = service.create_scan_job(
+        ScanRequest(
+            host_id=host.id,
+            trigger="scheduled",
+            idempotency_key="scheduled-test",
+        ),
+        actor="scheduler",
+    )
 
-    visible_ids = {item.id for item in service.list_findings(host.id)}
+    await service.process_scan(job.id)
+    remediation = service.list_remediations()[0]
 
-    assert visible_ids == set(second.finding_ids)
-    assert visible_ids.isdisjoint(first.finding_ids)
+    assert remediation.approval_state == "pending"
+    assert not [
+        item
+        for item in service.list_jobs()
+        if item.job_type == "remediation"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_executor_refuses_unapproved_remediation(service):
+    host = service.create_host(host_input())
+    scan = await completed_scan(service, host)
+    remediation = service.repository.get_remediation(scan.remediation_ids[0])
+
+    result = await SimulatedExecutor().execute(host, remediation)
+
+    assert result.success is False
+    assert "not approved" in result.summary
+
+
+def test_provider_cannot_clear_deterministic_conflicts():
+    fallback = {
+        "update_scope": "all",
+        "risk_level": "high",
+        "explanation": "Verified fallback",
+        "status": "insufficient_evidence",
+        "supporting_citations": ["packages.updates"],
+        "unresolved_conflicts": ["finding-1 lacks evidence"],
+    }
+
+    result = validate_orchestrator_response(
+        {
+            "status": "plan_ready",
+            "unresolved_conflicts": [],
+            "supporting_citations": ["packages.updates"],
+        },
+        fallback,
+        ["packages.updates"],
+    )
+
+    assert result["status"] == "insufficient_evidence"
+    assert result["unresolved_conflicts"] == ["finding-1 lacks evidence"]
+
+
+def test_provider_cannot_relax_deterministic_evidence_request():
+    finding = Finding(
+        id="finding-1",
+        host_id="host-1",
+        source_agent=AgentName.LOG_ANALYST,
+        category="logs",
+        severity=Severity.HIGH,
+        summary="Claim",
+        explanation="Claim",
+        evidence=[],
+        recommended_action=RecommendedAction(
+            action_type="manual_review",
+            title="Review",
+            rationale="Evidence is missing",
+        ),
+        requires_approval=True,
+        confidence=0.9,
+        created_at=utc_now(),
+    )
+    fallback = {
+        "response": "request_evidence",
+        "claim_ids": [finding.id],
+        "reasoning": "Missing evidence",
+        "citations": [],
+    }
+
+    result = validate_review_response(
+        {
+            "response": "confirm",
+            "claim_ids": [finding.id],
+            "reasoning": "Looks fine",
+            "citations": [],
+        },
+        [finding],
+        fallback,
+    )
+
+    assert result["response"] == "request_evidence"
 
 
 def test_model_router_assigns_capable_and_economy_models(settings):

@@ -33,6 +33,9 @@ describe("shared schemas", () => {
         updateScope: "all",
         riskLevel: "high",
         explanation: "Apply and validate the complete package set.",
+        status: "plan_ready",
+        supportingCitations: [],
+        unresolvedConflicts: [],
         agentAssignments: []
       },
       rebootAssessment: {
@@ -58,6 +61,10 @@ describe("shared schemas", () => {
       approvalScope: "patch_and_reboot_if_required",
       approvalState: "pending",
       executionState: "not_started",
+      planVersion: 1,
+      planHash: "plan-hash",
+      approvedBy: null,
+      approvedAt: null,
       result: null,
       preChangeProtection: {
         supported: false,

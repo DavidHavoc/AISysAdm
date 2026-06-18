@@ -79,16 +79,21 @@ python3 -m pip install -e "apps/api[dev]"
 npm install
 ```
 
-Optional PostgreSQL and Redis:
+PostgreSQL and Redis are mandatory for the private alpha:
 
 ```bash
-docker compose up -d
+docker compose up -d postgres redis
+cp .env.example .env
 ```
 
-Run the API and dashboard in separate terminals:
+Set `ADMIN_PASSWORD` and a URL-safe base64 `ENCRYPTION_KEY` that decodes to
+exactly 32 bytes. Then run the API, Celery worker, Celery Beat, and dashboard
+in separate terminals:
 
 ```bash
 npm run dev:api
+.venv/bin/celery -A sysadmin_api.tasks:celery_app worker --loglevel=INFO
+.venv/bin/celery -A sysadmin_api.tasks:celery_app beat --loglevel=INFO
 npm run dev:web
 ```
 
@@ -103,7 +108,7 @@ COLLECTOR_MODE=demo
 EXECUTION_MODE=simulate
 ```
 
-For real hosts, upload an SSH private key through `POST /credentials/ssh-keys`, assign the returned credential ID to a host, install Ansible on the control plane, then set:
+For real hosts, upload an SSH private key through `POST /credentials`, assign the returned credential ID to a host, install Ansible on the control plane, then set:
 
 ```text
 COLLECTOR_MODE=ssh
@@ -116,7 +121,8 @@ The local uploaded-key vault is for demos only. Use a managed secret store befor
 
 - PostgreSQL stores hosts, scans, evidence, findings, remediations, campaigns, approvals, and execution results.
 - Redis stores short-lived agent context with a TTL. It is never the audit source of truth.
-- Without either service, the API uses in-memory implementations.
+- Alpha startup fails closed unless both PostgreSQL and Redis are configured.
+- SQLite and inline jobs remain development and test conveniences only.
 
 ## Snapshot and rollback
 

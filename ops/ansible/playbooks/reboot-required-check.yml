@@ -4,11 +4,11 @@
   become: true
   gather_facts: false
   tasks:
-    - name: Check reboot-required file
+    - name: "[reboot.decision.marker] Check reboot-required file"
       ansible.builtin.stat:
         path: /var/run/reboot-required
       register: reboot_required
 
-    - name: Print reboot state
+    - name: "[reboot.decision.report] Print reboot state"
       ansible.builtin.debug:
         msg: "reboot_required={{ reboot_required.stat.exists | lower }}"

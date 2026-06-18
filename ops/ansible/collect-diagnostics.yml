@@ -1,0 +1,7 @@
+---
+- name: Collect bounded AI-readable Linux diagnostics
+  hosts: all
+  become: true
+  gather_facts: true
+  roles:
+    - diagnostic_profile
