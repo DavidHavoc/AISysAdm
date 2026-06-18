@@ -13,7 +13,12 @@ depends_on = None
 
 
 def upgrade() -> None:
-    Base.metadata.create_all(bind=op.get_bind())
+    baseline_tables = [
+        table
+        for table in Base.metadata.sorted_tables
+        if table.name not in {"campaign_hosts"}
+    ]
+    Base.metadata.create_all(bind=op.get_bind(), tables=baseline_tables)
 
 
 def downgrade() -> None:

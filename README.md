@@ -192,7 +192,64 @@ npm run build
 Run only the API tests:
 
 ```bash
-.venv/bin/pytest -q
+.venv/bin/pytest -q -m "not integration" apps/api/tests
+```
+
+## PostgreSQL and Redis integration tests
+
+The integration suite uses PostgreSQL and Redis, never SQLite. Its Compose
+project is isolated from the development stack and binds only to localhost:
+
+- PostgreSQL: `127.0.0.1:55432`
+- Redis: `127.0.0.1:56379`, database 15
+
+The test stack uses PostgreSQL trust authentication and fixed application test
+values. These values are local test fixtures, not production secrets. Database
+and Redis data live in container tmpfs mounts and are removed during cleanup.
+
+Start a fresh stack and apply Alembic migrations:
+
+```bash
+./scripts/integration.sh start
+```
+
+Run the integration suite. This recreates the stack and reapplies migrations
+before testing:
+
+```bash
+./scripts/integration.sh test
+```
+
+Run the suite and always clean up afterward:
+
+```bash
+./scripts/integration.sh verify
+```
+
+Remove containers, networks, and volumes:
+
+```bash
+./scripts/integration.sh cleanup
+```
+
+The integration suite covers:
+
+- Alembic head on a fresh PostgreSQL database
+- Atomic job claiming and concurrent worker claims
+- Transaction rollback after a PostgreSQL constraint failure
+- Healthy readiness plus Redis and PostgreSQL failure reporting
+- Ninety-day structured log retention
+- Celery task publication and execution through Redis
+
+SQLite remains useful for fast repository tests, but it does not reproduce
+PostgreSQL row locking, native JSON and timestamp behavior, or Alembic upgrade
+execution. In particular, SQLite does not enforce `SELECT FOR UPDATE` locking,
+so concurrent job-claim guarantees must be verified with PostgreSQL.
+
+Fast unit tests remain separate and do not require containers:
+
+```bash
+npm run test:api
 ```
 
 ## Private-alpha limitations
@@ -205,8 +262,7 @@ Run only the API tests:
 - Snapshot and rollback provider integrations are deferred.
 - The dashboard does not yet expose every API workflow.
 - Authentication currently targets a single private-alpha administrator.
-- PostgreSQL, Redis, SSH, Ansible, and Ubuntu VM integration coverage is still
-  incomplete.
+- SSH, Ansible, and Ubuntu VM integration coverage is still incomplete.
 - Deployment packaging, backup and restore automation, and production
   hardening are not complete.
 
