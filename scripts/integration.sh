@@ -17,6 +17,7 @@ export ADMIN_PASSWORD="integration-test-password"
 export ENCRYPTION_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 export COLLECTOR_MODE="demo"
 export EXECUTION_MODE="simulate"
+export PYTHONPATH="${ROOT_DIR}/apps/api${PYTHONPATH:+:${PYTHONPATH}}"
 
 compose() {
   docker compose \

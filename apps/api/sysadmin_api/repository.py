@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from threading import RLock
-from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Type, TypeVar
 
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, or_, select, text
 
 from .database import (
     AgentMessageRecord,
@@ -45,6 +47,7 @@ from .models import (
     SshCredential,
     StructuredLogEvent,
     User,
+    UserRole,
 )
 
 ModelT = TypeVar("ModelT")
@@ -90,6 +93,10 @@ def lease_expiration_failure(job: DurableJob, failed_at: datetime) -> JobFailure
     )
 
 
+def normalized_user_role(value: str) -> str:
+    return value.split(".", 1)[1].lower() if value.startswith("UserRole.") else value
+
+
 def terminalize_exhausted_job(job: DurableJob, failed_at: datetime) -> None:
     message = (
         job.last_failure.message
@@ -108,6 +115,10 @@ def terminalize_exhausted_job(job: DurableJob, failed_at: datetime) -> None:
 
 
 class Repository:
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        raise NotImplementedError
+
     def list_hosts(self) -> List[Host]:
         raise NotImplementedError
 
@@ -144,6 +155,24 @@ class Repository:
     ) -> Tuple[List[DurableJob], List[DurableJob]]:
         raise NotImplementedError
 
+    def get_campaign_for_update(self, campaign_id: str) -> Optional[PatchCampaign]:
+        raise NotImplementedError
+
+    def get_remediation_for_update(
+        self,
+        remediation_id: str,
+    ) -> Optional[Remediation]:
+        raise NotImplementedError
+
+    def cancel_job(
+        self,
+        job_id: str,
+        canceled_at: datetime,
+        allowed_statuses: Tuple[str, ...] = ("queued", "scheduled"),
+        phase: str = "canceled",
+    ) -> Optional[DurableJob]:
+        raise NotImplementedError
+
 
 class InMemoryRepository(Repository):
     def __init__(self) -> None:
@@ -164,6 +193,11 @@ class InMemoryRepository(Repository):
         self.users: Dict[str, Tuple[User, str]] = {}
         self.sessions: Dict[str, Dict[str, Any]] = {}
         self._lock = RLock()
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        with self._lock:
+            yield
 
     def list_hosts(self) -> List[Host]:
         return list(self.hosts.values())
@@ -276,6 +310,14 @@ class InMemoryRepository(Repository):
     def get_remediation(self, remediation_id: str) -> Optional[Remediation]:
         return self.remediations.get(remediation_id)
 
+    def get_remediation_for_update(
+        self,
+        remediation_id: str,
+    ) -> Optional[Remediation]:
+        with self._lock:
+            remediation = self.remediations.get(remediation_id)
+            return remediation.model_copy(deep=True) if remediation else None
+
     def save_campaign(self, campaign: PatchCampaign) -> PatchCampaign:
         self.campaigns[campaign.id] = campaign
         return campaign
@@ -285,6 +327,11 @@ class InMemoryRepository(Repository):
 
     def get_campaign(self, campaign_id: str) -> Optional[PatchCampaign]:
         return self.campaigns.get(campaign_id)
+
+    def get_campaign_for_update(self, campaign_id: str) -> Optional[PatchCampaign]:
+        with self._lock:
+            campaign = self.campaigns.get(campaign_id)
+            return campaign.model_copy(deep=True) if campaign else None
 
     def save_job(
         self,
@@ -298,6 +345,7 @@ class InMemoryRepository(Repository):
                     not current
                     or current.lease_owner != lease_owner
                     or current.status != "running"
+                    or lease_is_expired(current.lease_expires_at, job.updated_at)
                 ):
                     return None
                 if job.status == "running":
@@ -361,6 +409,7 @@ class InMemoryRepository(Repository):
                 not stored
                 or stored.status != "running"
                 or stored.lease_owner != lease_owner
+                or lease_is_expired(stored.lease_expires_at, heartbeat_at)
             ):
                 return None
             job = stored.model_copy(deep=True)
@@ -397,6 +446,28 @@ class InMemoryRepository(Repository):
                     recovered.append(job)
                 self.jobs[job.id] = job.model_copy(deep=True)
         return recovered, exhausted
+
+    def cancel_job(
+        self,
+        job_id: str,
+        canceled_at: datetime,
+        allowed_statuses: Tuple[str, ...] = ("queued", "scheduled"),
+        phase: str = "canceled",
+    ) -> Optional[DurableJob]:
+        with self._lock:
+            stored = self.jobs.get(job_id)
+            if not stored:
+                return None
+            job = stored.model_copy(deep=True)
+            if job.status in allowed_statuses:
+                job.status = "canceled"
+                job.current_phase = phase
+                job.completed_at = canceled_at
+                job.updated_at = canceled_at
+                job.lease_owner = None
+                job.lease_expires_at = None
+                self.jobs[job.id] = job.model_copy(deep=True)
+            return job
 
     def get_job(self, job_id: str) -> Optional[DurableJob]:
         job = self.jobs.get(job_id)
@@ -509,12 +580,64 @@ class InMemoryRepository(Repository):
 class SqlRepository(Repository):
     def __init__(self, database_url: str, create_schema: bool = False) -> None:
         self.engine, self.Session = create_session_factory(database_url)
+        self._active_session: ContextVar[Any] = ContextVar(
+            "sql_repository_active_session",
+            default=None,
+        )
         if create_schema:
             Base.metadata.create_all(self.engine)
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        active = self._active_session.get()
+        if active is not None:
+            yield
+            return
+        with self.Session.begin() as session:
+            token = self._active_session.set(session)
+            try:
+                yield
+            finally:
+                self._active_session.reset(token)
+
+    @contextmanager
+    def _session_scope(self, write: bool = False) -> Iterator[Any]:
+        active = self._active_session.get()
+        if active is not None:
+            yield active
+            return
+        manager = self.Session.begin if write else self.Session
+        with manager() as session:
+            token = self._active_session.set(session)
+            try:
+                yield session
+            finally:
+                self._active_session.reset(token)
 
     @staticmethod
     def _payload(item) -> dict:
         return item.model_dump(mode="json", by_alias=False)
+
+    @staticmethod
+    def _job_from_row(row: JobRecord) -> DurableJob:
+        payload = dict(row.payload)
+        payload.update(
+            {
+                "id": row.id,
+                "job_type": row.job_type,
+                "status": row.status,
+                "host_id": row.host_id,
+                "idempotency_key": row.idempotency_key,
+                "lease_owner": row.lease_owner,
+                "lease_expires_at": row.lease_expires_at,
+                "heartbeat_at": row.heartbeat_at,
+                "attempts": row.attempts,
+                "last_failure": row.last_failure,
+                "created_at": row.created_at,
+                "updated_at": row.updated_at,
+            }
+        )
+        return DurableJob.model_validate(payload)
 
     def list_hosts(self) -> List[Host]:
         return self._list_payload(HostRecord, Host)
@@ -525,7 +648,7 @@ class SqlRepository(Repository):
         return True
 
     def save_host(self, host: Host) -> Host:
-        with self.Session.begin() as session:
+        with self._session_scope(write=True) as session:
             record = session.get(HostRecord, host.id)
             values = {
                 "name": host.name,
@@ -546,7 +669,7 @@ class SqlRepository(Repository):
         return self._get_payload(HostRecord, Host, host_id)
 
     def delete_host(self, host_id: str) -> None:
-        with self.Session.begin() as session:
+        with self._session_scope(write=True) as session:
             session.execute(delete(HostRecord).where(HostRecord.id == host_id))
 
     def save_credential(
@@ -555,7 +678,7 @@ class SqlRepository(Repository):
         encrypted_key: bytes,
         nonce: bytes,
     ) -> SshCredential:
-        with self.Session.begin() as session:
+        with self._session_scope(write=True) as session:
             record = session.get(CredentialRecord, credential.id)
             values = {
                 "name": credential.name,
@@ -573,7 +696,7 @@ class SqlRepository(Repository):
         return credential
 
     def list_credentials(self) -> List[SshCredential]:
-        with self.Session() as session:
+        with self._session_scope() as session:
             rows = session.scalars(select(CredentialRecord)).all()
         return [
             SshCredential(
@@ -590,7 +713,7 @@ class SqlRepository(Repository):
         self,
         credential_id: str,
     ) -> Optional[Tuple[SshCredential, bytes, bytes]]:
-        with self.Session() as session:
+        with self._session_scope() as session:
             row = session.get(CredentialRecord, credential_id)
             if not row:
                 return None
@@ -607,7 +730,7 @@ class SqlRepository(Repository):
             )
 
     def delete_credential(self, credential_id: str) -> None:
-        with self.Session.begin() as session:
+        with self._session_scope(write=True) as session:
             session.execute(
                 delete(CredentialRecord).where(CredentialRecord.id == credential_id)
             )
@@ -626,7 +749,7 @@ class SqlRepository(Repository):
         )
 
     def get_schedule(self, host_id: str) -> Optional[HostSchedule]:
-        with self.Session() as session:
+        with self._session_scope() as session:
             row = session.scalar(
                 select(ScheduleRecord).where(ScheduleRecord.host_id == host_id)
             )
@@ -636,13 +759,13 @@ class SqlRepository(Repository):
         return self._list_payload(ScheduleRecord, HostSchedule)
 
     def delete_schedule(self, host_id: str) -> None:
-        with self.Session.begin() as session:
+        with self._session_scope(write=True) as session:
             session.execute(
                 delete(ScheduleRecord).where(ScheduleRecord.host_id == host_id)
             )
 
     def list_due_schedules(self, now: datetime) -> List[HostSchedule]:
-        with self.Session() as session:
+        with self._session_scope() as session:
             rows = session.scalars(
                 select(ScheduleRecord).where(
                     ScheduleRecord.enabled.is_(True),
@@ -685,7 +808,7 @@ class SqlRepository(Repository):
         statement = select(ScanRecord)
         if host_id:
             statement = statement.where(ScanRecord.host_id == host_id)
-        with self.Session() as session:
+        with self._session_scope() as session:
             rows = session.scalars(statement).all()
         return [ScanJob.model_validate(row.payload) for row in rows]
 
@@ -710,7 +833,7 @@ class SqlRepository(Repository):
         statement = select(AgentRunRecord)
         if scan_id:
             statement = statement.where(AgentRunRecord.scan_id == scan_id)
-        with self.Session() as session:
+        with self._session_scope() as session:
             rows = session.scalars(statement).all()
         return [AgentRun.model_validate(row.payload) for row in rows]
 
@@ -730,7 +853,7 @@ class SqlRepository(Repository):
         return messages
 
     def list_agent_messages(self, scan_id: str) -> List[AgentMessage]:
-        with self.Session() as session:
+        with self._session_scope() as session:
             rows = session.scalars(
                 select(AgentMessageRecord).where(
                     AgentMessageRecord.scan_id == scan_id
@@ -757,7 +880,7 @@ class SqlRepository(Repository):
         statement = select(FindingRecord)
         if host_id:
             statement = statement.where(FindingRecord.host_id == host_id)
-        with self.Session() as session:
+        with self._session_scope() as session:
             rows = session.scalars(statement).all()
         return [Finding.model_validate(row.payload) for row in rows]
 
@@ -782,8 +905,20 @@ class SqlRepository(Repository):
     def get_remediation(self, remediation_id: str) -> Optional[Remediation]:
         return self._get_payload(RemediationRecord, Remediation, remediation_id)
 
+    def get_remediation_for_update(
+        self,
+        remediation_id: str,
+    ) -> Optional[Remediation]:
+        with self._session_scope(write=True) as session:
+            row = session.scalar(
+                select(RemediationRecord)
+                .where(RemediationRecord.id == remediation_id)
+                .with_for_update()
+            )
+        return Remediation.model_validate(row.payload) if row else None
+
     def save_campaign(self, campaign: PatchCampaign) -> PatchCampaign:
-        with self.Session.begin() as session:
+        with self._session_scope(write=True) as session:
             record = session.get(CampaignRecord, campaign.id)
             values = {
                 "status": (
@@ -838,8 +973,31 @@ class SqlRepository(Repository):
         campaign = self._get_payload(CampaignRecord, PatchCampaign, campaign_id)
         return self._campaign_with_hosts(campaign) if campaign else None
 
+    def get_campaign_for_update(self, campaign_id: str) -> Optional[PatchCampaign]:
+        with self._session_scope(write=True) as session:
+            row = session.scalar(
+                select(CampaignRecord)
+                .where(CampaignRecord.id == campaign_id)
+                .with_for_update()
+            )
+            if not row:
+                return None
+            campaign = PatchCampaign.model_validate(row.payload)
+            rows = session.scalars(
+                select(CampaignHostRecord)
+                .where(CampaignHostRecord.campaign_id == campaign.id)
+                .with_for_update()
+            ).all()
+        if rows:
+            campaign.hosts = [
+                CampaignHostPlan.model_validate(host_row.payload)
+                for host_row in rows
+            ]
+            campaign.hosts.sort(key=lambda item: item.hostname)
+        return campaign
+
     def _campaign_with_hosts(self, campaign: PatchCampaign) -> PatchCampaign:
-        with self.Session() as session:
+        with self._session_scope() as session:
             rows = session.scalars(
                 select(CampaignHostRecord).where(
                     CampaignHostRecord.campaign_id == campaign.id
@@ -879,7 +1037,7 @@ class SqlRepository(Repository):
         job: DurableJob,
         lease_owner: Optional[str] = None,
     ) -> Optional[DurableJob]:
-        with self.Session.begin() as session:
+        with self._session_scope(write=True) as session:
             row = session.scalar(
                 select(JobRecord)
                 .where(JobRecord.id == job.id)
@@ -890,6 +1048,7 @@ class SqlRepository(Repository):
                     not row
                     or row.lease_owner != lease_owner
                     or row.status != "running"
+                    or lease_is_expired(row.lease_expires_at, job.updated_at)
                 ):
                     return None
                 if job.status == "running":
@@ -916,7 +1075,7 @@ class SqlRepository(Repository):
         started_at: datetime,
         lease_expires_at: datetime,
     ) -> Optional[DurableJob]:
-        with self.Session.begin() as session:
+        with self._session_scope(write=True) as session:
             row = session.scalar(
                 select(JobRecord)
                 .where(JobRecord.id == job_id)
@@ -924,14 +1083,14 @@ class SqlRepository(Repository):
             )
             if not row:
                 return None
-            job = DurableJob.model_validate(row.payload)
-            expired = job.status == "running" and lease_is_expired(
-                job.lease_expires_at,
+            job = self._job_from_row(row)
+            expired = row.status == "running" and lease_is_expired(
+                row.lease_expires_at,
                 started_at,
             )
-            if job.status != "queued" and not expired:
+            if row.status != "queued" and not expired:
                 return None
-            if job.attempts >= job.max_attempts:
+            if row.attempts >= job.max_attempts:
                 terminalize_exhausted_job(job, started_at)
                 for key, value in self._job_values(job).items():
                     setattr(row, key, value)
@@ -958,7 +1117,7 @@ class SqlRepository(Repository):
         heartbeat_at: datetime,
         lease_expires_at: datetime,
     ) -> Optional[DurableJob]:
-        with self.Session.begin() as session:
+        with self._session_scope(write=True) as session:
             row = session.scalar(
                 select(JobRecord)
                 .where(JobRecord.id == job_id)
@@ -968,9 +1127,10 @@ class SqlRepository(Repository):
                 not row
                 or row.status != "running"
                 or row.lease_owner != lease_owner
+                or lease_is_expired(row.lease_expires_at, heartbeat_at)
             ):
                 return None
-            job = DurableJob.model_validate(row.payload)
+            job = self._job_from_row(row)
             job.heartbeat_at = heartbeat_at
             job.lease_expires_at = lease_expires_at
             job.updated_at = heartbeat_at
@@ -984,16 +1144,20 @@ class SqlRepository(Repository):
     ) -> Tuple[List[DurableJob], List[DurableJob]]:
         recovered: List[DurableJob] = []
         exhausted: List[DurableJob] = []
-        with self.Session.begin() as session:
+        with self._session_scope(write=True) as session:
             rows = session.scalars(
                 select(JobRecord)
-                .where(JobRecord.status == "running")
+                .where(
+                    JobRecord.status == "running",
+                    or_(
+                        JobRecord.lease_expires_at.is_(None),
+                        JobRecord.lease_expires_at <= recovered_at,
+                    ),
+                )
                 .with_for_update(skip_locked=True)
             ).all()
             for row in rows:
-                job = DurableJob.model_validate(row.payload)
-                if not lease_is_expired(job.lease_expires_at, recovered_at):
-                    continue
+                job = self._job_from_row(row)
                 job.last_failure = lease_expiration_failure(job, recovered_at)
                 job.lease_owner = None
                 job.lease_expires_at = None
@@ -1009,21 +1173,52 @@ class SqlRepository(Repository):
                     setattr(row, key, value)
         return recovered, exhausted
 
+    def cancel_job(
+        self,
+        job_id: str,
+        canceled_at: datetime,
+        allowed_statuses: Tuple[str, ...] = ("queued", "scheduled"),
+        phase: str = "canceled",
+    ) -> Optional[DurableJob]:
+        with self._session_scope(write=True) as session:
+            row = session.scalar(
+                select(JobRecord)
+                .where(JobRecord.id == job_id)
+                .with_for_update()
+            )
+            if not row:
+                return None
+            job = self._job_from_row(row)
+            if row.status in allowed_statuses:
+                job.status = "canceled"
+                job.current_phase = phase
+                job.completed_at = canceled_at
+                job.updated_at = canceled_at
+                job.lease_owner = None
+                job.lease_expires_at = None
+                for key, value in self._job_values(job).items():
+                    setattr(row, key, value)
+            return job
+
     def get_job(self, job_id: str) -> Optional[DurableJob]:
-        return self._get_payload(JobRecord, DurableJob, job_id)
+        with self._session_scope() as session:
+            row = session.get(JobRecord, job_id)
+        return self._job_from_row(row) if row else None
 
     def get_job_by_idempotency(self, key: str) -> Optional[DurableJob]:
-        with self.Session() as session:
+        with self._session_scope() as session:
             row = session.scalar(
                 select(JobRecord).where(JobRecord.idempotency_key == key)
             )
-        return DurableJob.model_validate(row.payload) if row else None
+        return self._job_from_row(row) if row else None
 
     def list_jobs(self) -> List[DurableJob]:
-        return self._list_payload(JobRecord, DurableJob)
+        with self._session_scope() as session:
+            rows = session.scalars(select(JobRecord)).all()
+        return [self._job_from_row(row) for row in rows]
 
     def host_has_active_scan(self, host_id: str) -> bool:
-        with self.Session() as session:
+        with self._session_scope() as session:
             count = session.scalar(
                 select(func.count())
                 .select_from(JobRecord)
@@ -1089,13 +1284,13 @@ class SqlRepository(Repository):
             .offset((page - 1) * page_size)
             .limit(page_size)
         )
-        with self.Session() as session:
+        with self._session_scope() as session:
             rows = session.scalars(statement).all()
             total = int(session.scalar(count_statement) or 0)
         return [StructuredLogEvent.model_validate(row.payload) for row in rows], total
 
     def purge_logs_before(self, cutoff: datetime) -> int:
-        with self.Session.begin() as session:
+        with self._session_scope(write=True) as session:
             result = session.execute(
                 delete(LogEventRecord).where(LogEventRecord.timestamp < cutoff)
             )
@@ -1136,10 +1331,15 @@ class SqlRepository(Repository):
         return self._list_payload(AuditRecord, AuditEvent)
 
     def save_user(self, user: User, password_hash: str) -> User:
-        with self.Session.begin() as session:
+        with self._session_scope(write=True) as session:
             record = session.get(UserRecord, user.id)
             values = {
                 "username": user.username,
+                "role": (
+                    user.role.value
+                    if isinstance(user.role, UserRole)
+                    else normalized_user_role(str(user.role))
+                ),
                 "password_hash": password_hash,
                 "created_at": user.created_at,
             }
@@ -1151,21 +1351,35 @@ class SqlRepository(Repository):
         return user
 
     def get_user_by_username(self, username: str) -> Optional[Tuple[User, str]]:
-        with self.Session() as session:
+        with self._session_scope() as session:
             row = session.scalar(
                 select(UserRecord).where(UserRecord.username == username)
             )
         if not row:
             return None
         return (
-            User(id=row.id, username=row.username, created_at=row.created_at),
+            User(
+                id=row.id,
+                username=row.username,
+                role=normalized_user_role(row.role),
+                created_at=row.created_at,
+            ),
             row.password_hash,
         )
 
     def get_user(self, user_id: str) -> Optional[User]:
-        with self.Session() as session:
+        with self._session_scope() as session:
             row = session.get(UserRecord, user_id)
-        return User(id=row.id, username=row.username, created_at=row.created_at) if row else None
+        return (
+            User(
+                id=row.id,
+                username=row.username,
+                role=normalized_user_role(row.role),
+                created_at=row.created_at,
+            )
+            if row
+            else None
+        )
 
     def save_session(
         self,
@@ -1176,7 +1390,7 @@ class SqlRepository(Repository):
         expires_at: datetime,
         created_at: datetime,
     ) -> None:
-        with self.Session.begin() as session:
+        with self._session_scope(write=True) as session:
             session.add(
                 SessionRecord(
                     id=session_id,
@@ -1189,7 +1403,7 @@ class SqlRepository(Repository):
             )
 
     def get_session(self, token_hash: str) -> Optional[Dict[str, Any]]:
-        with self.Session() as session:
+        with self._session_scope() as session:
             row = session.scalar(
                 select(SessionRecord).where(SessionRecord.token_hash == token_hash)
             )
@@ -1204,7 +1418,7 @@ class SqlRepository(Repository):
         }
 
     def delete_session(self, token_hash: str) -> None:
-        with self.Session.begin() as session:
+        with self._session_scope(write=True) as session:
             session.execute(
                 delete(SessionRecord).where(SessionRecord.token_hash == token_hash)
             )
@@ -1215,17 +1429,17 @@ class SqlRepository(Repository):
         model_type: Type[ModelT],
         item_id: str,
     ) -> Optional[ModelT]:
-        with self.Session() as session:
+        with self._session_scope() as session:
             row = session.get(record_type, item_id)
         return model_type.model_validate(row.payload) if row else None
 
     def _list_payload(self, record_type, model_type: Type[ModelT]) -> List[ModelT]:
-        with self.Session() as session:
+        with self._session_scope() as session:
             rows = session.scalars(select(record_type)).all()
         return [model_type.model_validate(row.payload) for row in rows]
 
     def _upsert_payload(self, record_type, item: ModelT, values: Dict[str, Any]) -> ModelT:
-        with self.Session.begin() as session:
+        with self._session_scope(write=True) as session:
             row = session.get(record_type, item.id)
             payload = self._payload(item)
             if row:

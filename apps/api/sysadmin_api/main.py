@@ -16,6 +16,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 
+from .authorization import ProtectedAction
 from .config import BEAT_HEALTH_KEY, WORKER_HEALTH_KEY, Settings
 from .models import (
     Alert,
@@ -84,27 +85,29 @@ def create_app(
     app.state.runtime = resolved_runtime
     app.state.dispatcher = resolved_dispatcher
 
-    async def current_user(request: Request) -> User:
-        user = resolved_runtime.auth.authenticate(
-            request.cookies.get(SESSION_COOKIE)
-        )
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Authentication required",
+    def authorize(action: ProtectedAction, require_csrf: bool = False):
+        async def dependency(request: Request) -> User:
+            user = resolved_runtime.auth.authenticate(
+                request.cookies.get(SESSION_COOKIE)
             )
-        return user
+            if not user:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Authentication required",
+                )
+            if not resolved_runtime.authorization.authorize(user, action):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Not authorized for this action",
+                )
+            if require_csrf and not resolved_runtime.auth.verify_csrf(
+                request.cookies.get(SESSION_COOKIE),
+                request.headers.get(CSRF_HEADER),
+            ):
+                raise HTTPException(status_code=403, detail="CSRF token is invalid")
+            return user
 
-    async def mutation_user(
-        request: Request,
-        user: User = Depends(current_user),
-    ) -> User:
-        if not resolved_runtime.auth.verify_csrf(
-            request.cookies.get(SESSION_COOKIE),
-            request.headers.get(CSRF_HEADER),
-        ):
-            raise HTTPException(status_code=403, detail="CSRF token is invalid")
-        return user
+        return dependency
 
     @app.get("/")
     async def root():
@@ -199,7 +202,7 @@ def create_app(
             SESSION_COOKIE,
             token,
             httponly=True,
-            secure=resolved_settings.cookie_secure,
+            secure=resolved_settings.effective_cookie_secure,
             samesite="strict",
             max_age=resolved_settings.session_ttl_hours * 3600,
             path="/",
@@ -215,26 +218,37 @@ def create_app(
     async def logout(
         request: Request,
         response: Response,
-        user: User = Depends(mutation_user),
+        user: User = Depends(authorize(ProtectedAction.LOGOUT, require_csrf=True)),
     ):
         resolved_runtime.auth.logout(request.cookies.get(SESSION_COOKIE))
-        response.delete_cookie(SESSION_COOKIE, path="/")
+        response.delete_cookie(
+            SESSION_COOKIE,
+            path="/",
+            httponly=True,
+            secure=resolved_settings.effective_cookie_secure,
+            samesite="strict",
+        )
+        response.status_code = 204
         resolved_runtime.service.audit(user.username, "auth.logout", "session")
-        return Response(status_code=204)
+        return response
 
     @app.get("/auth/me", response_model=User)
-    async def me(user: User = Depends(current_user)):
+    async def me(user: User = Depends(authorize(ProtectedAction.VIEW_SESSION))):
         return user
 
     @app.get("/credentials", response_model=list[SshCredential])
-    async def list_credentials(user: User = Depends(current_user)):
+    async def list_credentials(
+        user: User = Depends(authorize(ProtectedAction.VIEW_CREDENTIALS))
+    ):
         return resolved_runtime.credentials.list_credentials()
 
     @app.post("/credentials", response_model=SshCredential, status_code=201)
     async def upload_key(
         name: str = Form(...),
         key: UploadFile = File(...),
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.MANAGE_CREDENTIALS, require_csrf=True)
+        ),
     ):
         try:
             credential = resolved_runtime.credentials.save_private_key(
@@ -255,9 +269,14 @@ def create_app(
     @app.delete("/credentials/{credential_id}", status_code=204)
     async def delete_credential(
         credential_id: str,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.MANAGE_CREDENTIALS, require_csrf=True)
+        ),
     ):
-        resolved_runtime.credentials.delete_credential(credential_id)
+        try:
+            resolved_runtime.credentials.delete_credential(credential_id)
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         resolved_runtime.service.audit(
             user.username,
             "credential.deleted",
@@ -267,13 +286,15 @@ def create_app(
         return Response(status_code=204)
 
     @app.get("/hosts", response_model=list[Host])
-    async def list_hosts(user: User = Depends(current_user)):
+    async def list_hosts(user: User = Depends(authorize(ProtectedAction.VIEW_HOSTS))):
         return resolved_runtime.service.list_hosts()
 
     @app.post("/hosts", response_model=Host, status_code=201)
     async def create_host(
         host: HostInput,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.MANAGE_HOSTS, require_csrf=True)
+        ),
     ):
         return resolved_runtime.service.create_host(host, user.username)
 
@@ -281,7 +302,9 @@ def create_app(
     async def update_host(
         host_id: str,
         host: HostInput,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.MANAGE_HOSTS, require_csrf=True)
+        ),
     ):
         try:
             return resolved_runtime.service.update_host(
@@ -295,7 +318,9 @@ def create_app(
     @app.delete("/hosts/{host_id}", status_code=204)
     async def delete_host(
         host_id: str,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.MANAGE_HOSTS, require_csrf=True)
+        ),
     ):
         try:
             resolved_runtime.service.delete_host(host_id, user.username)
@@ -310,7 +335,9 @@ def create_app(
     async def test_connection(
         host_id: str,
         payload: ConnectionTestRequest,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.TEST_HOST_CONNECTIONS, require_csrf=True)
+        ),
     ):
         try:
             return await resolved_runtime.service.test_connection(
@@ -324,7 +351,7 @@ def create_app(
     @app.post("/scans", response_model=DurableJob, status_code=202)
     async def queue_scan(
         payload: ScanRequest,
-        user: User = Depends(mutation_user),
+        user: User = Depends(authorize(ProtectedAction.RUN_SCANS, require_csrf=True)),
     ):
         try:
             job = resolved_runtime.service.create_scan_job(
@@ -339,12 +366,15 @@ def create_app(
     @app.get("/scans", response_model=list[ScanJob])
     async def list_scans(
         host_id: Optional[str] = Query(default=None, alias="hostId"),
-        user: User = Depends(current_user),
+        user: User = Depends(authorize(ProtectedAction.VIEW_SCANS)),
     ):
         return resolved_runtime.service.list_scans(host_id)
 
     @app.get("/scans/{scan_id}", response_model=ScanJob)
-    async def get_scan(scan_id: str, user: User = Depends(current_user)):
+    async def get_scan(
+        scan_id: str,
+        user: User = Depends(authorize(ProtectedAction.VIEW_SCANS)),
+    ):
         scan = resolved_runtime.service.get_scan(scan_id)
         if not scan:
             raise HTTPException(status_code=404, detail="Scan not found")
@@ -353,16 +383,20 @@ def create_app(
     @app.get("/hosts/{host_id}/findings")
     async def list_host_findings(
         host_id: str,
-        user: User = Depends(current_user),
+        user: User = Depends(authorize(ProtectedAction.VIEW_FINDINGS)),
     ):
         return resolved_runtime.service.list_findings(host_id)
 
     @app.get("/findings")
-    async def list_findings(user: User = Depends(current_user)):
+    async def list_findings(
+        user: User = Depends(authorize(ProtectedAction.VIEW_FINDINGS))
+    ):
         return resolved_runtime.service.list_findings()
 
     @app.get("/remediations", response_model=list[Remediation])
-    async def list_remediations(user: User = Depends(current_user)):
+    async def list_remediations(
+        user: User = Depends(authorize(ProtectedAction.VIEW_REMEDIATIONS))
+    ):
         return resolved_runtime.service.list_remediations()
 
     @app.post(
@@ -372,7 +406,9 @@ def create_app(
     async def approve_remediation(
         remediation_id: str,
         payload: ApprovalRequest,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.MANAGE_REMEDIATIONS, require_csrf=True)
+        ),
     ):
         try:
             return resolved_runtime.service.approve_remediation_plan(
@@ -390,7 +426,9 @@ def create_app(
     async def approve_remediation_reboot(
         remediation_id: str,
         payload: ApprovalRequest,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.MANAGE_REMEDIATIONS, require_csrf=True)
+        ),
     ):
         try:
             return resolved_runtime.service.approve_remediation_reboot(
@@ -408,7 +446,9 @@ def create_app(
     )
     async def execute_remediation(
         remediation_id: str,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.MANAGE_REMEDIATIONS, require_csrf=True)
+        ),
     ):
         try:
             job = resolved_runtime.service.prepare_remediation_job(
@@ -426,7 +466,9 @@ def create_app(
     )
     async def reject_remediation(
         remediation_id: str,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.MANAGE_REMEDIATIONS, require_csrf=True)
+        ),
     ):
         try:
             return resolved_runtime.service.reject_remediation(
@@ -437,18 +479,24 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/jobs", response_model=list[DurableJob])
-    async def list_jobs(user: User = Depends(current_user)):
+    async def list_jobs(user: User = Depends(authorize(ProtectedAction.VIEW_JOBS))):
         return resolved_runtime.service.list_jobs()
 
     @app.get("/jobs/{job_id}", response_model=DurableJob)
-    async def get_job(job_id: str, user: User = Depends(current_user)):
+    async def get_job(
+        job_id: str,
+        user: User = Depends(authorize(ProtectedAction.VIEW_JOBS)),
+    ):
         job = resolved_runtime.service.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         return job
 
     @app.get("/hosts/{host_id}/schedule", response_model=HostSchedule)
-    async def get_schedule(host_id: str, user: User = Depends(current_user)):
+    async def get_schedule(
+        host_id: str,
+        user: User = Depends(authorize(ProtectedAction.VIEW_SCHEDULES)),
+    ):
         try:
             return resolved_runtime.service.get_schedule(host_id)
         except ValueError as error:
@@ -458,7 +506,9 @@ def create_app(
     async def update_schedule(
         host_id: str,
         payload: HostScheduleInput,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.MANAGE_SCHEDULES, require_csrf=True)
+        ),
     ):
         try:
             return resolved_runtime.service.save_schedule(
@@ -470,20 +520,22 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/schedules", response_model=list[HostSchedule])
-    async def list_schedules(user: User = Depends(current_user)):
+    async def list_schedules(
+        user: User = Depends(authorize(ProtectedAction.VIEW_SCHEDULES))
+    ):
         return resolved_runtime.service.list_schedules()
 
     @app.get("/agent-runs")
     async def list_agent_runs(
         scan_id: Optional[str] = Query(default=None, alias="scanId"),
-        user: User = Depends(current_user),
+        user: User = Depends(authorize(ProtectedAction.VIEW_AGENT_ACTIVITY)),
     ):
         return resolved_runtime.service.list_agent_runs(scan_id)
 
     @app.get("/agent-runs/{scan_id}/messages")
     async def list_agent_messages(
         scan_id: str,
-        user: User = Depends(current_user),
+        user: User = Depends(authorize(ProtectedAction.VIEW_AGENT_ACTIVITY)),
     ):
         return resolved_runtime.service.list_agent_messages(scan_id)
 
@@ -500,7 +552,7 @@ def create_app(
         source: Optional[str] = None,
         phase_id: Optional[str] = Query(default=None, alias="phaseId"),
         task_id: Optional[str] = Query(default=None, alias="taskId"),
-        user: User = Depends(current_user),
+        user: User = Depends(authorize(ProtectedAction.VIEW_LOGS)),
     ):
         return resolved_runtime.service.list_logs(
             {
@@ -519,20 +571,27 @@ def create_app(
         )
 
     @app.get("/logs/{log_id}", response_model=StructuredLogEvent)
-    async def get_log(log_id: str, user: User = Depends(current_user)):
+    async def get_log(
+        log_id: str,
+        user: User = Depends(authorize(ProtectedAction.VIEW_LOGS)),
+    ):
         item = resolved_runtime.service.get_log(log_id)
         if not item:
             raise HTTPException(status_code=404, detail="Log event not found")
         return item
 
     @app.get("/alerts", response_model=list[Alert])
-    async def list_alerts(user: User = Depends(current_user)):
+    async def list_alerts(
+        user: User = Depends(authorize(ProtectedAction.VIEW_ALERTS))
+    ):
         return resolved_runtime.service.list_alerts()
 
     @app.post("/alerts/{alert_id}/acknowledge", response_model=Alert)
     async def acknowledge_alert(
         alert_id: str,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.ACKNOWLEDGE_ALERTS, require_csrf=True)
+        ),
     ):
         try:
             return resolved_runtime.service.acknowledge_alert(
@@ -543,17 +602,21 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(error)) from error
 
     @app.get("/audit-events", response_model=list[AuditEvent])
-    async def list_audit_events(user: User = Depends(current_user)):
+    async def list_audit_events(
+        user: User = Depends(authorize(ProtectedAction.VIEW_AUDIT))
+    ):
         return resolved_runtime.service.list_audits()
 
     @app.get("/campaigns", response_model=list[PatchCampaign])
-    async def list_campaigns(user: User = Depends(current_user)):
+    async def list_campaigns(
+        user: User = Depends(authorize(ProtectedAction.VIEW_CAMPAIGNS))
+    ):
         return resolved_runtime.service.list_campaigns()
 
     @app.get("/campaigns/{campaign_id}", response_model=PatchCampaign)
     async def get_campaign(
         campaign_id: str,
-        user: User = Depends(current_user),
+        user: User = Depends(authorize(ProtectedAction.VIEW_CAMPAIGNS)),
     ):
         try:
             return resolved_runtime.service.get_campaign(campaign_id)
@@ -563,7 +626,9 @@ def create_app(
     @app.post("/campaigns", response_model=PatchCampaign, status_code=201)
     async def create_campaign(
         payload: CampaignRequest,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.MANAGE_CAMPAIGNS, require_csrf=True)
+        ),
     ):
         try:
             return resolved_runtime.service.create_campaign(
@@ -580,7 +645,9 @@ def create_app(
     )
     async def create_campaign_proposals(
         campaign_id: str,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.MANAGE_CAMPAIGNS, require_csrf=True)
+        ),
     ):
         try:
             campaign, jobs = resolved_runtime.service.queue_campaign_proposals(
@@ -608,7 +675,9 @@ def create_app(
         campaign_id: str,
         host_id: str,
         payload: ApprovalRequest,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.MANAGE_CAMPAIGNS, require_csrf=True)
+        ),
     ):
         try:
             return resolved_runtime.service.approve_campaign_host(
@@ -628,7 +697,9 @@ def create_app(
         campaign_id: str,
         host_id: str,
         payload: ApprovalRequest,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.MANAGE_CAMPAIGNS, require_csrf=True)
+        ),
     ):
         try:
             return resolved_runtime.service.approve_campaign_host_reboot(
@@ -647,7 +718,9 @@ def create_app(
     async def reject_campaign_host(
         campaign_id: str,
         host_id: str,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.MANAGE_CAMPAIGNS, require_csrf=True)
+        ),
     ):
         try:
             return resolved_runtime.service.reject_campaign_host(
@@ -665,7 +738,9 @@ def create_app(
     )
     async def execute_campaign(
         campaign_id: str,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.MANAGE_CAMPAIGNS, require_csrf=True)
+        ),
     ):
         try:
             campaign, jobs = resolved_runtime.service.prepare_campaign_execution(
@@ -691,7 +766,9 @@ def create_app(
     )
     async def cancel_campaign(
         campaign_id: str,
-        user: User = Depends(mutation_user),
+        user: User = Depends(
+            authorize(ProtectedAction.MANAGE_CAMPAIGNS, require_csrf=True)
+        ),
     ):
         try:
             return resolved_runtime.service.cancel_campaign(

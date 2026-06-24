@@ -164,6 +164,27 @@ async def test_worker_crash_is_recovered_and_job_completes(service):
     assert completed.last_failure.category == "worker_lease_expired"
 
 
+def test_recovery_handles_expired_job_without_related_scan_record(service):
+    queued = job("job-orphaned-recovery")
+    service.repository.save_job(queued)
+    claimed_at = utc_now()
+    service.repository.claim_job(
+        queued.id,
+        "crashed-worker",
+        claimed_at,
+        claimed_at + timedelta(seconds=5),
+    )
+
+    recovered = service.recover_expired_jobs(
+        claimed_at + timedelta(seconds=6)
+    )
+    current = service.get_job(queued.id)
+
+    assert [item.id for item in recovered] == [queued.id]
+    assert current.status == "queued"
+    assert current.current_phase == "retry_scheduled"
+
+
 @pytest.mark.asyncio
 async def test_retry_exhaustion_reaches_terminal_failure(service):
     class FailingCollector(DemoCollector):

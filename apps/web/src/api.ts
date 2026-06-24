@@ -83,11 +83,19 @@ export const api = {
     form.append("key", file);
     return request<SshCredential>("/credentials", { method: "POST", body: form });
   },
+  deleteCredential: (credentialId: string) =>
+    request<void>(`/credentials/${credentialId}`, { method: "DELETE" }),
   listHosts: () => request<Host[]>("/hosts"),
   createHost: (input: HostInput) => request<Host>("/hosts", {
     method: "POST",
     body: JSON.stringify(input)
   }),
+  updateHost: (hostId: string, input: HostInput) => request<Host>(`/hosts/${hostId}`, {
+    method: "PUT",
+    body: JSON.stringify(input)
+  }),
+  deleteHost: (hostId: string) =>
+    request<void>(`/hosts/${hostId}`, { method: "DELETE" }),
   testConnection: (hostId: string, confirmFingerprint?: string) =>
     request<ConnectionTestResult>(`/hosts/${hostId}/test-connection`, {
       method: "POST",
@@ -125,6 +133,7 @@ export const api = {
   rejectRemediation: (remediationId: string) =>
     request<Remediation>(`/remediations/${remediationId}/reject`, { method: "POST" }),
   listJobs: () => request<DurableJob[]>("/jobs"),
+  getJob: (jobId: string) => request<DurableJob>(`/jobs/${jobId}`),
   listSchedules: () => request<HostSchedule[]>("/schedules"),
   updateSchedule: (
     hostId: string,

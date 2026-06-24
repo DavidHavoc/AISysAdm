@@ -28,7 +28,7 @@ from .models import (
     utc_now,
 )
 from .providers import ModelRouter, ProviderCompletion, ProviderError, RoutedModel
-from .redaction import compact_json, redact_payload
+from .redaction import compact_json, redact_payload, redact_text
 from .verifier import DeterministicVerifier
 
 
@@ -922,7 +922,7 @@ def validate_orchestrator_response(
 
 def safe_provider_error(error: Exception) -> str:
     if isinstance(error, ProviderError):
-        return str(error)[:300]
+        return redact_text(str(error))[:300]
     return "AI provider request failed; deterministic output used."
 
 

@@ -25,7 +25,7 @@ from .models import (
     SystemSummary,
     utc_now,
 )
-from .redaction import redact_text
+from .redaction import redact_text, sanitize_log_event
 from .ssh_utils import scan_host_key, temporary_known_hosts
 
 
@@ -263,7 +263,7 @@ class SshCollector(HostCollector):
                 sudo_available=False,
                 os_supported=False,
                 ansible_compatible=False,
-                checks={"host_key": str(error)},
+                checks={"host_key": redact_text(str(error), host)},
             )
         try:
             with self.credentials.temporary_key(host.credential_id) as key_path:
@@ -302,7 +302,7 @@ class SshCollector(HostCollector):
                 checks=checks,
             )
         except Exception as error:
-            checks["ssh"] = str(error)
+            checks["ssh"] = redact_text(str(error), host)
             return ConnectionTestResult(
                 success=False,
                 ssh_reachable=False,
@@ -463,7 +463,8 @@ def collection_event(
         if state.status in ("missing", "unavailable", "permission_denied", "truncated")
         else Severity.INFO
     )
-    return StructuredLogEvent(
+    return sanitize_log_event(
+        StructuredLogEvent(
         id="log-%s" % uuid4().hex[:12],
         timestamp=utc_now(),
         host_id=host.id,
@@ -477,11 +478,11 @@ def collection_event(
         source="ssh:%s" % source_name,
         truncated=state.truncated,
         original_bytes=state.original_bytes,
-        redacted=source_name
-        in ("auth", "users", "sudo_posture", "interfaces", "routes", "dns"),
         simulated=simulated,
         remediation_relevance="diagnostic",
         correlation_ids={"host_id": host.id, "scan_id": scan_id},
+        ),
+        host,
     )
 
 

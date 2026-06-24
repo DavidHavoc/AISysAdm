@@ -14,6 +14,8 @@ execution. Safe demo collection and simulated execution are enabled by default.
 ## Current features
 
 - Authenticated operator dashboard with CSRF-protected mutations
+- Login throttling with Redis-backed counters and safe in-process fallback
+- Centralized admin-only authorization policy with explicit future role names
 - Encrypted SSH credential storage
 - Host inventory and connection testing
 - Manual and scheduled scans
@@ -26,11 +28,12 @@ execution. Safe demo collection and simulated execution are enabled by default.
 - Explicit reboot assessment and reboot policy enforcement
 - Simulated execution and catalog-based Ansible execution
 - Durable PostgreSQL job, scan, finding, remediation, audit, and log records
+- Durable job leases, heartbeats, bounded retries, and stale-worker recovery
 - Celery workers and Celery Beat backed by Redis
 - Atomic job claiming to prevent duplicate execution
 - Structured logs, alerts, audit events, and 90-day log retention
 - External provider routing with sensitive-value redaction
-- PostgreSQL and Redis readiness checks
+- PostgreSQL and Redis readiness checks plus expiring worker and Beat health markers
 - Campaign proposals, per-host approvals, execution, cancellation, and results
 
 ## Safety model
@@ -50,6 +53,9 @@ Scheduled scans may produce findings and remediation proposals, but they never
 approve or execute a remediation. Unsupported provider claims are excluded from
 findings and plans. Deterministic conflicts and evidence requirements cannot be
 removed by a provider response.
+
+The current threat model is documented in
+[`docs/threat-model.md`](docs/threat-model.md).
 
 ## Architecture
 
@@ -110,6 +116,18 @@ Set these required values in `.env`:
 ADMIN_PASSWORD=<strong password>
 ENCRYPTION_KEY=<URL-safe base64 encoding of exactly 32 random bytes>
 ```
+
+In `APP_ENVIRONMENT=alpha`, cookies must be marked secure unless the control
+plane is running on `localhost`, `127.0.0.1`, or `::1` and the explicit
+localhost exception remains enabled:
+
+```text
+COOKIE_SECURE=true
+ALLOW_INSECURE_LOCALHOST_ALPHA_COOKIES=true
+```
+
+The localhost exception keeps local alpha testing and integration work from
+breaking silently, but it is only intended for loopback development.
 
 One way to generate the encryption key is:
 
@@ -252,14 +270,34 @@ Fast unit tests remain separate and do not require containers:
 npm run test:api
 ```
 
+## Credential encryption-key rotation
+
+Credential rows are encrypted with one active symmetric key. Live key rotation
+is not implemented.
+
+Use a maintenance window for rotation:
+
+1. Stop API writes and background workers.
+2. Back up the database and any credential inventory you need to preserve.
+3. Re-encrypt credentials under a new `ENCRYPTION_KEY` through an offline
+   migration or by re-uploading them after deployment.
+4. Update `ENCRYPTION_KEY` or `ENCRYPTION_KEY_FILE` everywhere the API and
+   workers run.
+5. Restart the control plane and verify credential-backed SSH and Ansible
+   actions before resuming operations.
+
+If you change the key without re-encrypting stored credentials, previously
+saved SSH keys will no longer decrypt.
+
 ## Private-alpha limitations
 
 - Campaign execution controls are not yet enabled in the dashboard. The API
   contract is documented in
   [`docs/frontend-campaign-contract.md`](docs/frontend-campaign-contract.md).
-- Jobs have atomic claiming, but worker leases, heartbeats, bounded retries,
-  and stale-job recovery are not implemented.
-- Readiness checks PostgreSQL and Redis, but not worker or Celery Beat health.
+- Login throttling falls back to per-process memory if Redis is unavailable, so
+  multi-process coordination is temporarily reduced until Redis recovers.
+- SQLite remains a development convenience and cannot verify PostgreSQL row
+  locking, `SELECT FOR UPDATE`, or lease-timing behavior.
 - Snapshot and rollback provider integrations are deferred.
 - The dashboard does not yet expose every API workflow.
 - Authentication currently targets a single private-alpha administrator.

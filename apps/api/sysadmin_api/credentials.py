@@ -43,9 +43,20 @@ class CredentialService:
         return self.repository.list_credentials()
 
     def delete_credential(self, credential_id: str) -> None:
+        attached_hosts = [
+            host
+            for host in self.repository.list_hosts()
+            if host.credential_id == credential_id
+        ]
+        if attached_hosts:
+            names = ", ".join(sorted(host.name for host in attached_hosts))
+            raise ValueError(
+                "Credential is still assigned to host(s): %s. Remove it from those "
+                "hosts before deleting the credential." % names
+            )
         self.repository.delete_credential(credential_id)
 
-    def decrypt(self, credential_id: str) -> bytes:
+    def _decrypt_private_key(self, credential_id: str) -> bytes:
         record = self.repository.get_credential_record(credential_id)
         if not record:
             raise ValueError("SSH credential not found")
@@ -60,7 +71,7 @@ class CredentialService:
     def temporary_key(self, credential_id: Optional[str]) -> Iterator[Path]:
         if not credential_id:
             raise ValueError("Host has no SSH credential")
-        content = self.decrypt(credential_id)
+        content = self._decrypt_private_key(credential_id)
         file_descriptor, raw_path = tempfile.mkstemp(prefix="ai-sysadm-key-")
         path = Path(raw_path)
         try:

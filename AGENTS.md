@@ -5,8 +5,6 @@ and productively in this repository.
 
 ## Required Style
 
-- Never use em dashes in code comments, documentation, commit messages, or user
-  facing responses for this project.
 - Keep language plain and operational. This is an internal sysadmin control
   plane, not a marketing site.
 - Prefer concise, high signal updates and summaries.

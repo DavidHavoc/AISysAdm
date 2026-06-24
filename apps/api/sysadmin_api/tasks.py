@@ -9,6 +9,7 @@ from celery.signals import heartbeat_sent, worker_ready
 from redis import Redis
 
 from .config import BEAT_HEALTH_KEY, WORKER_HEALTH_KEY, Settings
+from .redaction import sanitize_celery_payload
 from .runtime import get_runtime
 
 
@@ -108,7 +109,7 @@ def run_scan(self, job_id: str):
         get_runtime().service.process_scan(job_id, _worker_id(self))
     )
     _schedule_retry(run_scan, job)
-    return job.model_dump(mode="json")
+    return sanitize_celery_payload(job.model_dump(mode="json"))
 
 
 @celery_app.task(
@@ -121,7 +122,7 @@ def run_remediation(self, job_id: str):
         get_runtime().service.process_remediation(job_id, _worker_id(self))
     )
     _schedule_retry(run_remediation, job)
-    return job.model_dump(mode="json")
+    return sanitize_celery_payload(job.model_dump(mode="json"))
 
 
 @celery_app.task(name="sysadmin.dispatch_schedules")

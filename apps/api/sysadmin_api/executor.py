@@ -19,6 +19,7 @@ from .models import (
     StructuredLogEvent,
     utc_now,
 )
+from .redaction import redact_text, sanitize_log_event
 from .ssh_utils import scan_host_key, temporary_known_hosts
 
 
@@ -414,41 +415,50 @@ class AnsibleExecutor(RemediationExecutor):
             for value in (stdout, stderr)
             if value
         )
-        events = parse_callback_events(event_path)
+        safe_output = redact_text(output[:131072], host)
+        events = parse_callback_events(event_path, host)
         event_path.unlink(missing_ok=True)
         if not events:
             events.append(
-                StructuredLogEvent(
-                    id="log-%s" % uuid4().hex[:12],
-                    timestamp=utc_now(),
-                    host_id=host.id,
-                    job_id=job_id or None,
-                    scan_id=remediation.scan_id,
-                    remediation_id=remediation.id,
-                    playbook_id=Path(playbook).stem,
-                    phase_id=phase_id,
-                    event_type="ansible_process",
-                    evidence_category="remediation",
-                    severity=Severity.INFO if process.returncode == 0 else Severity.HIGH,
-                    status="succeeded" if process.returncode == 0 else "failed",
-                    return_code=process.returncode,
-                    stdout=stdout.decode(errors="replace")[:65536],
-                    stderr=stderr.decode(errors="replace")[:65536],
-                    raw_output=output[:131072],
-                    source="ansible-playbook",
-                    remediation_relevance="execution",
+                sanitize_log_event(
+                    StructuredLogEvent(
+                        id="log-%s" % uuid4().hex[:12],
+                        timestamp=utc_now(),
+                        host_id=host.id,
+                        job_id=job_id or None,
+                        scan_id=remediation.scan_id,
+                        remediation_id=remediation.id,
+                        playbook_id=Path(playbook).stem,
+                        phase_id=phase_id,
+                        event_type="ansible_process",
+                        evidence_category="remediation",
+                        severity=(
+                            Severity.INFO
+                            if process.returncode == 0
+                            else Severity.HIGH
+                        ),
+                        status="succeeded" if process.returncode == 0 else "failed",
+                        return_code=process.returncode,
+                        stdout=stdout.decode(errors="replace")[:65536],
+                        stderr=stderr.decode(errors="replace")[:65536],
+                        raw_output=output[:131072],
+                        source="ansible-playbook",
+                        remediation_relevance="execution",
+                    ),
+                    host,
                 )
             )
-        return process.returncode == 0, output, events
+        return process.returncode == 0, safe_output, events
 
 
-def parse_callback_events(path: Path) -> List[StructuredLogEvent]:
+def parse_callback_events(path: Path, host: Host) -> List[StructuredLogEvent]:
     events: List[StructuredLogEvent] = []
     if not path.exists():
         return events
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
-            events.append(StructuredLogEvent.model_validate_json(line))
+            event = StructuredLogEvent.model_validate_json(line)
+            events.append(sanitize_log_event(event, host))
         except Exception:
             continue
     return events

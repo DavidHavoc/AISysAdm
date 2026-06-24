@@ -6,6 +6,7 @@ export type Severity = z.infer<typeof severitySchema>;
 export const userSchema = z.object({
   id: z.string(),
   username: z.string(),
+  role: z.enum(["admin", "operator", "auditor"]),
   createdAt: z.string()
 });
 export type User = z.infer<typeof userSchema>;

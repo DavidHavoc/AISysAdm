@@ -1,6 +1,7 @@
 import base64
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import urlparse
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,6 +23,7 @@ class Settings(BaseSettings):
     app_environment: str = "development"
     app_base_url: str = "http://localhost:8080"
     cookie_secure: bool = False
+    allow_insecure_localhost_alpha_cookies: bool = True
     session_ttl_hours: int = 12
     admin_username: str = "admin"
     admin_password: Optional[str] = None
@@ -108,3 +110,23 @@ class Settings(BaseSettings):
             ("redis://", "rediss://")
         ):
             raise RuntimeError("Alpha mode requires a Redis REDIS_URL")
+        if not self.effective_cookie_secure and not self._localhost_cookie_exception():
+            raise RuntimeError(
+                "Alpha mode requires COOKIE_SECURE=true unless APP_BASE_URL points "
+                "to localhost, 127.0.0.1, or ::1 and "
+                "ALLOW_INSECURE_LOCALHOST_ALPHA_COOKIES is enabled"
+            )
+
+    @property
+    def effective_cookie_secure(self) -> bool:
+        if self.cookie_secure:
+            return True
+        if self.app_environment == "alpha" and self._localhost_cookie_exception():
+            return False
+        return False
+
+    def _localhost_cookie_exception(self) -> bool:
+        if not self.allow_insecure_localhost_alpha_cookies:
+            return False
+        host = (urlparse(self.app_base_url).hostname or "").strip("[]").lower()
+        return host in {"localhost", "127.0.0.1", "::1"}

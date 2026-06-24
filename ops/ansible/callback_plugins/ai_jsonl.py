@@ -24,13 +24,46 @@ requirements:
 SENSITIVE_KEYS = {
     "password",
     "passwd",
+    "passphrase",
     "private_key",
     "secret",
     "token",
     "authorization",
+    "api_key",
+    "access_key",
+    "client_secret",
+    "email",
+    "username",
+    "hostname",
+    "address",
 }
 TASK_PATTERN = re.compile(r"^\[([a-zA-Z0-9_.-]+)\]\s*(.*)$")
 MAX_FIELD_BYTES = 65536
+PRIVATE_KEY_PATTERN = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+AUTHORIZATION_HEADER_PATTERN = re.compile(
+    r"(?i)\bauthorization\b\s*([:=])\s*(?:bearer|basic|token)?\s*[^\s,;]+"
+)
+BEARER_TOKEN_PATTERN = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}")
+KEY_VALUE_SECRET_PATTERN = re.compile(
+    r"(?i)\b(password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret)\b"
+    r"\s*([:=])\s*(\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+)
+IDENTITY_KEY_VALUE_PATTERN = re.compile(
+    r"(?i)\b(hostname|host|user|username|login|address)\b"
+    r"\s*([:=])\s*(\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+)
+API_KEY_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+)
 
 
 class CallbackModule(CallbackBase):
@@ -69,9 +102,10 @@ class CallbackModule(CallbackBase):
         match = TASK_PATTERN.match(task_name)
         task_id = match.group(1) if match else str(result._task._uuid)
         readable_name = match.group(2) if match else task_name
-        raw = sanitize(result._result)
+        raw, raw_meta = sanitize(result._result)
         stdout, stdout_meta = bounded(raw.get("stdout", ""))
         stderr, stderr_meta = bounded(raw.get("stderr", raw.get("msg", "")))
+        raw_output, _ = bounded(raw)
         duration_ms = int(
             (
                 time.monotonic()
@@ -105,12 +139,12 @@ class CallbackModule(CallbackBase):
             "after_value": raw.get("after"),
             "stdout": stdout,
             "stderr": stderr,
-            "raw_output": json.dumps(raw, default=str)[:131072],
+            "raw_output": raw_output[:131072],
             "source": str(getattr(result._task, "action", "ansible")),
             "truncated": stdout_meta["truncated"] or stderr_meta["truncated"],
             "original_bytes": stdout_meta["original_bytes"]
             + stderr_meta["original_bytes"],
-            "redacted": True,
+            "redacted": raw_meta["applied"] or raw_meta["safe"],
             "simulated": False,
             "externally_processed": False,
             "reboot_relevance": (
@@ -135,25 +169,130 @@ class CallbackModule(CallbackBase):
             handle.write("\n")
 
 
+def placeholder_for_key(key):
+    lowered = key.lower()
+    if any(token in lowered for token in ("private_key", "private-key", "ssh_key")):
+        return "[PRIVATE_KEY]"
+    if "authorization" in lowered or lowered == "auth_header":
+        return "[AUTHORIZATION]"
+    if "bearer" in lowered and "token" in lowered:
+        return "[BEARER_TOKEN]"
+    if any(token in lowered for token in ("password", "passwd", "passphrase")):
+        return "[PASSWORD]"
+    if "api_key" in lowered or lowered == "apikey":
+        return "[API_KEY]"
+    if "access_key" in lowered:
+        return "[API_KEY]"
+    if "client_secret" in lowered or lowered == "secret":
+        return "[SECRET]"
+    if lowered == "token" or lowered.endswith("_token"):
+        return "[TOKEN]"
+    if "email" in lowered:
+        return "[EMAIL]"
+    if lowered in {"username", "user", "login"} or lowered.endswith("_username"):
+        return "[USERNAME]"
+    if "hostname" in lowered or lowered.endswith("_hostname") or lowered == "host_name":
+        return "[HOSTNAME]"
+    if "address" in lowered or lowered in {"ip", "ip_address"}:
+        return "[ADDRESS]"
+    return "[REDACTED]"
+
+
+def preserve_quotes(value, placeholder):
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return "%s%s%s" % (value[0], placeholder, value[0])
+    return placeholder
+
+
+def replace_key_value_secret(match):
+    key = match.group(1)
+    separator = match.group(2)
+    raw_value = match.group(3)
+    placeholder = placeholder_for_key(key)
+    return "%s%s%s" % (key, separator, preserve_quotes(raw_value, placeholder))
+
+
+def replace_identity_key_value(match):
+    key = match.group(1)
+    separator = match.group(2)
+    raw_value = match.group(3)
+    placeholder = {
+        "hostname": "[HOSTNAME]",
+        "host": "[HOSTNAME]",
+        "user": "[USERNAME]",
+        "username": "[USERNAME]",
+        "login": "[USERNAME]",
+        "address": "[ADDRESS]",
+    }.get(key.lower(), "[REDACTED]")
+    return "%s%s%s" % (key, separator, preserve_quotes(raw_value, placeholder))
+
+
+def sanitize_string(value):
+    redacted = value
+    redacted = PRIVATE_KEY_PATTERN.sub("[PRIVATE_KEY]", redacted)
+    redacted = AUTHORIZATION_HEADER_PATTERN.sub(
+        lambda match: "Authorization%s [AUTHORIZATION]" % match.group(1),
+        redacted,
+    )
+    redacted = BEARER_TOKEN_PATTERN.sub("Bearer [BEARER_TOKEN]", redacted)
+    redacted = KEY_VALUE_SECRET_PATTERN.sub(replace_key_value_secret, redacted)
+    redacted = IDENTITY_KEY_VALUE_PATTERN.sub(replace_identity_key_value, redacted)
+    for pattern in API_KEY_PATTERNS:
+        redacted = pattern.sub("[API_KEY]", redacted)
+    redacted = EMAIL_PATTERN.sub("[EMAIL]", redacted)
+    redacted = IP_PATTERN.sub("[IP_ADDRESS]", redacted)
+    applied = redacted != value
+    return redacted, applied, (not applied and string_is_safe(value))
+
+
+def string_is_safe(value):
+    if PRIVATE_KEY_PATTERN.search(value):
+        return False
+    if AUTHORIZATION_HEADER_PATTERN.search(value):
+        return False
+    if BEARER_TOKEN_PATTERN.search(value):
+        return False
+    if KEY_VALUE_SECRET_PATTERN.search(value):
+        return False
+    if IDENTITY_KEY_VALUE_PATTERN.search(value):
+        return False
+    if EMAIL_PATTERN.search(value):
+        return False
+    if IP_PATTERN.search(value):
+        return False
+    return not any(pattern.search(value) for pattern in API_KEY_PATTERNS)
+
+
 def sanitize(value):
     if isinstance(value, dict):
-        return {
-            key: "[REDACTED]"
-            if any(token in key.lower() for token in SENSITIVE_KEYS)
-            else sanitize(item)
-            for key, item in value.items()
-            if key != "invocation"
-        }
+        sanitized = {}
+        applied = False
+        safe = True
+        for key, item in value.items():
+            if key == "invocation":
+                continue
+            if any(token in key.lower() for token in SENSITIVE_KEYS) and item is not None:
+                sanitized[key] = placeholder_for_key(key)
+                applied = True
+                continue
+            rendered, item_applied, item_safe = sanitize(item)
+            sanitized[key] = rendered
+            applied = applied or item_applied
+            safe = safe and item_safe
+        return sanitized, applied, safe
     if isinstance(value, list):
-        return [sanitize(item) for item in value]
+        sanitized = []
+        applied = False
+        safe = True
+        for item in value:
+            rendered, item_applied, item_safe = sanitize(item)
+            sanitized.append(rendered)
+            applied = applied or item_applied
+            safe = safe and item_safe
+        return sanitized, applied, safe
     if isinstance(value, str):
-        value = re.sub(
-            r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
-            "[IP_ADDRESS]",
-            value,
-        )
-        return value
-    return value
+        return sanitize_string(value)
+    return value, False, True
 
 
 def bounded(value):

@@ -9,6 +9,7 @@ from typing import Optional
 from redis import Redis
 
 from .agents import MultiAgentWorkflow
+from .authorization import AlphaAuthorizationPolicy, AuthorizationPolicy
 from .collector import DemoCollector, SshCollector
 from .config import Settings
 from .contracts import AgentContractLoader
@@ -28,6 +29,7 @@ class Runtime:
     redis_client: Optional[Redis]
     credentials: CredentialService
     auth: AuthService
+    authorization: AuthorizationPolicy
     service: SysadminService
 
 
@@ -97,6 +99,7 @@ def build_runtime(
         redis_client=redis_client,
         credentials=credentials,
         auth=auth,
+        authorization=AlphaAuthorizationPolicy(),
         service=service,
     )
 

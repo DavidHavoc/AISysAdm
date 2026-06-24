@@ -39,6 +39,7 @@ from .models import (
     StructuredLogEvent,
     utc_now,
 )
+from .redaction import redact_text, sanitize_audit_details, sanitize_log_event
 from .repository import Repository
 
 
@@ -99,7 +100,7 @@ class SysadminService:
             HostScheduleInput(),
             actor=actor,
         )
-        self.audit(actor, "host.created", "host", host.id, {"name": host.name})
+        self.audit(actor, "host.created", "host", host.id)
         return host
 
     def update_host(
@@ -124,7 +125,7 @@ class SysadminService:
         host = self._host(host_id)
         self.repository.delete_schedule(host_id)
         self.repository.delete_host(host_id)
-        self.audit(actor, "host.deleted", "host", host_id, {"name": host.name})
+        self.audit(actor, "host.deleted", "host", host_id)
 
     async def test_connection(
         self,
@@ -269,23 +270,24 @@ class SysadminService:
         except JobLeaseLost:
             return self._job(job_id)
         except Exception as error:
+            error_text = self._redact_text(str(error), host.id)
             failed = self.fail_job(
                 job,
-                str(error),
+                error_text,
                 host.id,
                 lease_owner=owner,
                 retryable=not isinstance(error, NonRetryableJobError),
                 category=getattr(error, "category", "scan_execution"),
             )
             scan.status = "queued" if failed.status == "queued" else "failed"
-            scan.error = str(error)[:2000]
+            scan.error = error_text[:2000]
             scan.updated_at = utc_now()
             self.repository.save_scan(scan)
             if scan.campaign_id and failed.status == "failed":
                 self._mark_campaign_proposal_failed(
                     scan.campaign_id,
                     host.id,
-                    str(error),
+                    error_text,
                 )
             return failed
 
@@ -324,7 +326,7 @@ class SysadminService:
         self.repository.save_agent_messages(result.messages)
         self.repository.save_findings(result.findings)
         self.repository.save_log_events(
-            agent_events(host.id, job.id, scan.id, result.runs, result.messages)
+            agent_events(host, job.id, scan.id, result.runs, result.messages)
         )
         remediation_ids: List[str] = []
         if result.remediation:
@@ -470,62 +472,65 @@ class SysadminService:
         remediation_id: str,
         actor: str,
         campaign_id: Optional[str] = None,
+        sync_campaigns: bool = True,
     ) -> DurableJob:
-        remediation = self._remediation(remediation_id)
-        host = self._host(remediation.host_id)
-        self._ensure_current_remediation_plan(remediation)
-        approval_error = self._remediation_approval_error(remediation, host)
-        if approval_error:
-            raise ValueError(approval_error)
-        now = utc_now()
-        key = "remediation:%s:%s" % (
-            remediation.id,
-            remediation.plan_hash,
-        )
-        existing = self.repository.get_job_by_idempotency(key)
-        if existing:
-            if existing.campaign_id != campaign_id:
-                raise ValueError(
-                    "This exact remediation plan already has an execution job"
-                )
-            return existing
-        approval_scope = (
-            "patch_only"
-            if remediation.reboot_assessment.status == "not_expected"
-            else "patch_and_reboot_if_required"
-        )
-        job = DurableJob(
-            id=new_id("job"),
-            job_type="remediation",
-            status=(
-                "queued"
-                if self._timing_allows(remediation, now)
-                else "scheduled"
-            ),
-            host_id=host.id,
-            scan_id=remediation.scan_id,
-            remediation_id=remediation.id,
-            campaign_id=campaign_id,
-            approved_plan_version=remediation.plan_version,
-            approved_plan_hash=remediation.plan_hash,
-            approval_scope=approval_scope,
-            idempotency_key=key,
-            created_at=now,
-            updated_at=now,
-        )
-        remediation.execution_state = (
-            "queued" if job.status == "queued" else "waiting_for_window"
-        )
-        self.repository.save_remediation(remediation)
-        self.repository.save_job(job)
-        self.audit(
-            actor,
-            "remediation.execution_queued",
-            "remediation",
-            remediation.id,
-            {"job_id": job.id, "plan_hash": remediation.plan_hash},
-        )
-        self._sync_campaigns_for_remediation(remediation.id)
+        with self.repository.transaction():
+            remediation = self._remediation_for_update(remediation_id)
+            host = self._host(remediation.host_id)
+            self._ensure_current_remediation_plan(remediation)
+            approval_error = self._remediation_approval_error(remediation, host)
+            if approval_error:
+                raise ValueError(approval_error)
+            now = utc_now()
+            key = "remediation:%s:%s" % (
+                remediation.id,
+                remediation.plan_hash,
+            )
+            existing = self.repository.get_job_by_idempotency(key)
+            if existing:
+                if existing.campaign_id != campaign_id:
+                    raise ValueError(
+                        "This exact remediation plan already has an execution job"
+                    )
+                return existing
+            approval_scope = (
+                "patch_only"
+                if remediation.reboot_assessment.status == "not_expected"
+                else "patch_and_reboot_if_required"
+            )
+            job = DurableJob(
+                id=new_id("job"),
+                job_type="remediation",
+                status=(
+                    "queued"
+                    if self._timing_allows(remediation, now)
+                    else "scheduled"
+                ),
+                host_id=host.id,
+                scan_id=remediation.scan_id,
+                remediation_id=remediation.id,
+                campaign_id=campaign_id,
+                approved_plan_version=remediation.plan_version,
+                approved_plan_hash=remediation.plan_hash,
+                approval_scope=approval_scope,
+                idempotency_key=key,
+                created_at=now,
+                updated_at=now,
+            )
+            remediation.execution_state = (
+                "queued" if job.status == "queued" else "waiting_for_window"
+            )
+            self.repository.save_remediation(remediation)
+            self.repository.save_job(job)
+            self.audit(
+                actor,
+                "remediation.execution_queued",
+                "remediation",
+                remediation.id,
+                {"job_id": job.id, "plan_hash": remediation.plan_hash},
+            )
+        if sync_campaigns:
+            self._sync_campaigns_for_remediation(remediation.id)
         return job
 
     async def process_remediation(
@@ -539,16 +544,18 @@ class SysadminService:
         if existing.status == "queued" and existing.campaign_id:
             campaign = self._campaign(existing.campaign_id)
             if campaign.status == CampaignStatus.CANCELED:
-                existing.status = "canceled"
-                existing.current_phase = "canceled"
-                existing.completed_at = utc_now()
-                existing.updated_at = utc_now()
-                remediation.execution_state = "canceled"
-                remediation.updated_at = utc_now()
-                self.repository.save_job(existing)
-                self.repository.save_remediation(remediation)
-                self._sync_campaigns_for_remediation(remediation.id)
-                return existing
+                canceled = self.repository.cancel_job(
+                    existing.id,
+                    utc_now(),
+                    allowed_statuses=("queued",),
+                    phase="canceled",
+                )
+                if canceled and canceled.status == "canceled":
+                    remediation.execution_state = "canceled"
+                    remediation.updated_at = utc_now()
+                    self.repository.save_remediation(remediation)
+                    self._sync_campaigns_for_remediation(remediation.id)
+                return canceled or self._job(job_id)
         if existing.status == "queued" and not self._timing_allows(
             remediation,
             utc_now(),
@@ -606,9 +613,10 @@ class SysadminService:
             return self._job(job_id)
         except Exception as error:
             retryable = not isinstance(error, NonRetryableJobError)
+            error_text = self._redact_text(str(error), host.id)
             failed = self.fail_job(
                 job,
-                str(error),
+                error_text,
                 host.id,
                 lease_owner=owner,
                 retryable=retryable,
@@ -850,16 +858,18 @@ class SysadminService:
         recovered, exhausted = self.repository.recover_expired_jobs(current)
         for job in recovered:
             if job.job_type == "scan":
-                scan = self._scan(job.scan_id)
-                scan.status = "queued"
-                scan.error = job.last_failure.message if job.last_failure else None
-                scan.updated_at = current
-                self.repository.save_scan(scan)
+                scan = self.repository.get_scan(job.scan_id or "")
+                if scan:
+                    scan.status = "queued"
+                    scan.error = job.last_failure.message if job.last_failure else None
+                    scan.updated_at = current
+                    self.repository.save_scan(scan)
             elif job.job_type == "remediation":
-                remediation = self._remediation(job.remediation_id)
-                remediation.execution_state = "queued"
-                remediation.updated_at = current
-                self.repository.save_remediation(remediation)
+                remediation = self.repository.get_remediation(job.remediation_id or "")
+                if remediation:
+                    remediation.execution_state = "queued"
+                    remediation.updated_at = current
+                    self.repository.save_remediation(remediation)
             self.audit(
                 "scheduler",
                 "job.lease_recovered",
@@ -869,16 +879,18 @@ class SysadminService:
             )
         for job in exhausted:
             if job.job_type == "scan":
-                scan = self._scan(job.scan_id)
-                scan.status = "failed"
-                scan.error = job.error
-                scan.updated_at = current
-                self.repository.save_scan(scan)
+                scan = self.repository.get_scan(job.scan_id or "")
+                if scan:
+                    scan.status = "failed"
+                    scan.error = job.error
+                    scan.updated_at = current
+                    self.repository.save_scan(scan)
             elif job.job_type == "remediation":
-                remediation = self._remediation(job.remediation_id)
-                remediation.execution_state = "failed"
-                remediation.updated_at = current
-                self.repository.save_remediation(remediation)
+                remediation = self.repository.get_remediation(job.remediation_id or "")
+                if remediation:
+                    remediation.execution_state = "failed"
+                    remediation.updated_at = current
+                    self.repository.save_remediation(remediation)
             self._record_terminal_job_failure(job, job.host_id)
         return recovered
 
@@ -1153,129 +1165,135 @@ class SysadminService:
         campaign_id: str,
         actor: str,
     ) -> Tuple[PatchCampaign, List[DurableJob]]:
-        campaign = self._sync_campaign(self._campaign(campaign_id))
-        if campaign.status in (
-            CampaignStatus.CANCELLING,
-            CampaignStatus.CANCELED,
-            CampaignStatus.SUCCEEDED,
-            CampaignStatus.FAILED,
-        ):
-            raise ValueError("Campaign cannot execute in its current state")
-        jobs: List[DurableJob] = []
-        for host_plan in campaign.hosts:
-            if len(jobs) >= campaign.batch_size:
-                break
-            if host_plan.state != CampaignHostState.APPROVED:
-                continue
-            if not host_plan.remediation_id:
-                continue
-            remediation = self._remediation(host_plan.remediation_id)
-            try:
-                self._validate_campaign_plan_binding(host_plan, remediation)
-                job = self.prepare_remediation_job(
-                    host_plan.remediation_id,
-                    actor,
-                    campaign_id=campaign.id,
+        with self.repository.transaction():
+            campaign = self._sync_campaign(self._campaign_for_update(campaign_id))
+            if campaign.status in (
+                CampaignStatus.CANCELLING,
+                CampaignStatus.CANCELED,
+                CampaignStatus.SUCCEEDED,
+                CampaignStatus.FAILED,
+            ):
+                raise ValueError("Campaign cannot execute in its current state")
+            jobs: List[DurableJob] = []
+            for host_plan in campaign.hosts:
+                if len(jobs) >= campaign.batch_size:
+                    break
+                if host_plan.state != CampaignHostState.APPROVED:
+                    continue
+                if not host_plan.remediation_id:
+                    continue
+                remediation = self._remediation(host_plan.remediation_id)
+                try:
+                    self._validate_campaign_plan_binding(host_plan, remediation)
+                    job = self.prepare_remediation_job(
+                        host_plan.remediation_id,
+                        actor,
+                        campaign_id=campaign.id,
+                        sync_campaigns=False,
+                    )
+                except ValueError as error:
+                    host_plan.state = CampaignHostState.PLAN_CHANGED
+                    host_plan.failure_summary = self._redact_text(
+                        str(error),
+                        host_plan.host_id,
+                    )
+                    host_plan.updated_at = utc_now()
+                    continue
+                host_plan.job_id = job.id
+                host_plan.state = (
+                    CampaignHostState.QUEUED
+                    if job.status == "queued"
+                    else CampaignHostState.SCHEDULED
                 )
-            except ValueError as error:
-                host_plan.state = CampaignHostState.PLAN_CHANGED
-                host_plan.failure_summary = str(error)
                 host_plan.updated_at = utc_now()
-                continue
-            host_plan.job_id = job.id
-            host_plan.state = (
-                CampaignHostState.QUEUED
-                if job.status == "queued"
-                else CampaignHostState.SCHEDULED
+                jobs.append(job)
+            if not jobs:
+                self._refresh_campaign_state(campaign)
+                self.repository.save_campaign(campaign)
+                raise ValueError("Campaign has no approved host plans ready to execute")
+            campaign.status = CampaignStatus.RUNNING
+            campaign.current_batch = min(
+                campaign.total_batches,
+                campaign.current_batch + 1,
             )
-            host_plan.updated_at = utc_now()
-            jobs.append(job)
-        if not jobs:
-            self._refresh_campaign_state(campaign)
+            campaign.updated_at = utc_now()
             self.repository.save_campaign(campaign)
-            raise ValueError("Campaign has no approved host plans ready to execute")
-        campaign.status = CampaignStatus.RUNNING
-        campaign.current_batch = min(
-            campaign.total_batches,
-            campaign.current_batch + 1,
-        )
-        campaign.updated_at = utc_now()
-        self.repository.save_campaign(campaign)
-        self.audit(
-            actor,
-            "campaign.execution_queued",
-            "campaign",
-            campaign.id,
-            {"job_ids": [job.id for job in jobs]},
-        )
+            self.audit(
+                actor,
+                "campaign.execution_queued",
+                "campaign",
+                campaign.id,
+                {"job_ids": [job.id for job in jobs]},
+            )
         return campaign, jobs
 
     def cancel_campaign(self, campaign_id: str, actor: str) -> PatchCampaign:
-        campaign = self._sync_campaign(self._campaign(campaign_id))
-        if campaign.status in (
-            CampaignStatus.SUCCEEDED,
-            CampaignStatus.FAILED,
-            CampaignStatus.CANCELED,
-        ) or (
-            campaign.status == CampaignStatus.PARTIALLY_SUCCEEDED
-            and all(
-                host.state
-                in (
+        with self.repository.transaction():
+            campaign = self._sync_campaign(self._campaign_for_update(campaign_id))
+            if campaign.status in (
+                CampaignStatus.SUCCEEDED,
+                CampaignStatus.FAILED,
+                CampaignStatus.CANCELED,
+            ) or (
+                campaign.status == CampaignStatus.PARTIALLY_SUCCEEDED
+                and all(
+                    host.state
+                    in (
+                        CampaignHostState.SUCCEEDED,
+                        CampaignHostState.FAILED,
+                        CampaignHostState.CANCELED,
+                        CampaignHostState.REJECTED,
+                        CampaignHostState.BLOCKED,
+                        CampaignHostState.NO_ACTION,
+                    )
+                    for host in campaign.hosts
+                )
+            ):
+                raise ValueError("Completed campaigns cannot be canceled")
+            has_running = False
+            now = utc_now()
+            for host_plan in campaign.hosts:
+                if host_plan.state in (
                     CampaignHostState.SUCCEEDED,
                     CampaignHostState.FAILED,
-                    CampaignHostState.CANCELED,
-                    CampaignHostState.REJECTED,
-                    CampaignHostState.BLOCKED,
                     CampaignHostState.NO_ACTION,
-                )
-                for host in campaign.hosts
-            )
-        ):
-            raise ValueError("Completed campaigns cannot be canceled")
-        active_jobs = [
-            self.repository.get_job(host_plan.job_id or "")
-            for host_plan in campaign.hosts
-            if host_plan.job_id
-        ]
-        has_running = any(job and job.status == "running" for job in active_jobs)
-        now = utc_now()
-        for host_plan in campaign.hosts:
-            if host_plan.state in (
-                CampaignHostState.SUCCEEDED,
-                CampaignHostState.FAILED,
-                CampaignHostState.NO_ACTION,
-                CampaignHostState.RUNNING,
-            ):
-                continue
-            job = self.repository.get_job(host_plan.job_id or "")
-            if job and job.status in ("queued", "scheduled"):
-                job.status = "canceled"
-                job.current_phase = "canceled"
-                job.completed_at = now
-                job.updated_at = now
-                self.repository.save_job(job)
-            if host_plan.remediation_id:
-                remediation = self._remediation(host_plan.remediation_id)
-                if remediation.execution_state in (
-                    "not_started",
-                    "queued",
-                    "waiting_for_window",
                 ):
-                    remediation.execution_state = "canceled"
-                    remediation.updated_at = now
-                    self.repository.save_remediation(remediation)
-            host_plan.state = CampaignHostState.CANCELED
-            host_plan.updated_at = now
-        campaign.status = (
-            CampaignStatus.CANCELLING
-            if has_running
-            else CampaignStatus.CANCELED
-        )
-        campaign.canceled_by = actor
-        campaign.canceled_at = now
-        campaign.updated_at = now
-        self.repository.save_campaign(campaign)
-        self.audit(actor, "campaign.canceled", "campaign", campaign.id)
+                    continue
+                job = (
+                    self.repository.cancel_job(host_plan.job_id, now)
+                    if host_plan.job_id
+                    else None
+                )
+                if job and job.status == "running":
+                    has_running = True
+                    host_plan.state = CampaignHostState.RUNNING
+                    host_plan.updated_at = now
+                    continue
+                if job and job.status not in ("canceled", "queued", "scheduled"):
+                    host_plan.updated_at = now
+                    continue
+                if host_plan.remediation_id:
+                    remediation = self._remediation_for_update(host_plan.remediation_id)
+                    if remediation.execution_state in (
+                        "not_started",
+                        "queued",
+                        "waiting_for_window",
+                    ):
+                        remediation.execution_state = "canceled"
+                        remediation.updated_at = now
+                        self.repository.save_remediation(remediation)
+                host_plan.state = CampaignHostState.CANCELED
+                host_plan.updated_at = now
+            campaign.status = (
+                CampaignStatus.CANCELLING
+                if has_running
+                else CampaignStatus.CANCELED
+            )
+            campaign.canceled_by = actor
+            campaign.canceled_at = now
+            campaign.updated_at = now
+            self.repository.save_campaign(campaign)
+            self.audit(actor, "campaign.canceled", "campaign", campaign.id)
         return campaign
 
     def fail_job(
@@ -1288,12 +1306,13 @@ class SysadminService:
         category: str = "job_execution",
     ) -> DurableJob:
         now = utc_now()
+        safe_error = self._redact_text(error, host_id)
         will_retry = retryable and job.attempts < job.max_attempts
         job.last_failure = JobFailure(
             failed_at=now,
             attempt=job.attempts,
             category=category,
-            message=error[:2000],
+            message=safe_error[:2000],
             retryable=will_retry,
         )
         job.updated_at = now
@@ -1306,7 +1325,7 @@ class SysadminService:
             job.completed_at = None
         else:
             job.status = "failed"
-            job.error = error[:2000]
+            job.error = safe_error[:2000]
             job.current_phase = "failed"
             job.completed_at = now
         saved = self.repository.save_job(job, lease_owner=lease_owner)
@@ -1402,11 +1421,12 @@ class SysadminService:
         host_id: Optional[str] = None,
         job_id: Optional[str] = None,
     ) -> Alert:
+        safe_message = self._redact_text(message, host_id)
         alert = Alert(
             id=new_id("alert"),
             severity=severity,
             title=title,
-            message=message[:2000],
+            message=safe_message[:2000],
             host_id=host_id,
             job_id=job_id,
             created_at=utc_now(),
@@ -1427,7 +1447,7 @@ class SysadminService:
             action=action,
             target_type=target_type,
             target_id=target_id,
-            details=details or {},
+            details=sanitize_audit_details(details),
             created_at=utc_now(),
         )
         return self.repository.save_audit(event)
@@ -1458,14 +1478,34 @@ class SysadminService:
             raise ValueError("Job not found")
         return job
 
+    def _redact_text(
+        self,
+        value: str,
+        host_id: Optional[str] = None,
+    ) -> str:
+        host = self.repository.get_host(host_id or "") if host_id else None
+        return redact_text(value, host)
+
     def _remediation(self, remediation_id: Optional[str]) -> Remediation:
         remediation = self.repository.get_remediation(remediation_id or "")
         if not remediation:
             raise ValueError("Remediation not found")
         return remediation
 
+    def _remediation_for_update(self, remediation_id: Optional[str]) -> Remediation:
+        remediation = self.repository.get_remediation_for_update(remediation_id or "")
+        if not remediation:
+            raise ValueError("Remediation not found")
+        return remediation
+
     def _campaign(self, campaign_id: str) -> PatchCampaign:
         campaign = self.repository.get_campaign(campaign_id)
+        if not campaign:
+            raise ValueError("Campaign not found")
+        return campaign
+
+    def _campaign_for_update(self, campaign_id: str) -> PatchCampaign:
+        campaign = self.repository.get_campaign_for_update(campaign_id)
         if not campaign:
             raise ValueError("Campaign not found")
         return campaign
@@ -1661,7 +1701,7 @@ class SysadminService:
         campaign = self._campaign(campaign_id)
         host_plan = self._campaign_host(campaign, host_id)
         host_plan.state = CampaignHostState.FAILED
-        host_plan.failure_summary = error[:2000]
+        host_plan.failure_summary = self._redact_text(error, host_id)[:2000]
         host_plan.updated_at = utc_now()
         campaign.updated_at = utc_now()
         self.repository.save_campaign(campaign)
@@ -1700,13 +1740,19 @@ class SysadminService:
                 CampaignHostState.RUNNING,
             ):
                 continue
-            job = self.repository.get_job(host_plan.job_id or "")
-            if job and job.status in ("queued", "scheduled"):
-                job.status = "canceled"
-                job.current_phase = "canceled_after_campaign_failure"
-                job.completed_at = now
-                job.updated_at = now
-                self.repository.save_job(job)
+            job = (
+                self.repository.cancel_job(
+                    host_plan.job_id,
+                    now,
+                    phase="canceled_after_campaign_failure",
+                )
+                if host_plan.job_id
+                else None
+            )
+            if job and job.status == "running":
+                host_plan.state = CampaignHostState.RUNNING
+                host_plan.updated_at = now
+                continue
             if host_plan.remediation_id:
                 remediation = self._remediation(host_plan.remediation_id)
                 if remediation.execution_state in (
@@ -2067,7 +2113,7 @@ def execution_failure_is_non_retryable(summary: str, changed: bool) -> bool:
 
 
 def agent_events(
-    host_id: str,
+    host: Host,
     job_id: str,
     scan_id: str,
     runs: List[AgentRun],
@@ -2076,42 +2122,47 @@ def agent_events(
     events: List[StructuredLogEvent] = []
     for run in runs:
         events.append(
-            StructuredLogEvent(
-                id=new_id("log"),
-                timestamp=run.created_at,
-                duration_ms=run.latency_ms,
-                host_id=host_id,
-                job_id=job_id,
-                scan_id=scan_id,
-                agent_run_id=run.id,
-                event_type="agent_run",
-                evidence_category="ai_analysis",
-                severity=Severity.INFO,
-                status=run.status,
-                stdout=str(run.output)[:65536],
-                source="agent:%s" % run.agent.name,
-                redacted=run.externally_processed,
-                externally_processed=run.externally_processed,
-                remediation_relevance="analysis",
-                correlation_ids={"scan_id": scan_id, "agent_run_id": run.id},
+            sanitize_log_event(
+                StructuredLogEvent(
+                    id=new_id("log"),
+                    timestamp=run.created_at,
+                    duration_ms=run.latency_ms,
+                    host_id=host.id,
+                    job_id=job_id,
+                    scan_id=scan_id,
+                    agent_run_id=run.id,
+                    event_type="agent_run",
+                    evidence_category="ai_analysis",
+                    severity=Severity.INFO,
+                    status=run.status,
+                    stdout=str(run.output)[:65536],
+                    source="agent:%s" % run.agent.name,
+                    externally_processed=run.externally_processed,
+                    remediation_relevance="analysis",
+                    correlation_ids={"scan_id": scan_id, "agent_run_id": run.id},
+                ),
+                host,
             )
         )
     for message in messages:
         events.append(
-            StructuredLogEvent(
-                id=new_id("log"),
-                timestamp=message.created_at,
-                host_id=host_id,
-                job_id=job_id,
-                scan_id=scan_id,
-                event_type="agent_message",
-                evidence_category="agent_conversation",
-                severity=Severity.INFO,
-                status=message.response,
-                stdout=message.reasoning,
-                source="%s->%s" % (message.from_agent, message.to_agent),
-                remediation_relevance="analysis",
-                correlation_ids={"scan_id": scan_id, "message_id": message.id},
+            sanitize_log_event(
+                StructuredLogEvent(
+                    id=new_id("log"),
+                    timestamp=message.created_at,
+                    host_id=host.id,
+                    job_id=job_id,
+                    scan_id=scan_id,
+                    event_type="agent_message",
+                    evidence_category="agent_conversation",
+                    severity=Severity.INFO,
+                    status=message.response,
+                    stdout=message.reasoning,
+                    source="%s->%s" % (message.from_agent, message.to_agent),
+                    remediation_relevance="analysis",
+                    correlation_ids={"scan_id": scan_id, "message_id": message.id},
+                ),
+                host,
             )
         )
     return events

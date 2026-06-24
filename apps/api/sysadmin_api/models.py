@@ -45,6 +45,12 @@ class ModelTier(str, Enum):
     DETERMINISTIC = "deterministic"
 
 
+class UserRole(str, Enum):
+    ADMIN = "admin"
+    OPERATOR = "operator"
+    AUDITOR = "auditor"
+
+
 class CampaignStatus(str, Enum):
     DRAFT = "draft"
     PROPOSING = "proposing"
@@ -582,6 +588,7 @@ class AuditEvent(ApiModel):
 class User(ApiModel):
     id: str
     username: str
+    role: UserRole = UserRole.ADMIN
     created_at: datetime
 
 

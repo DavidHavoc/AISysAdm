@@ -27,6 +27,7 @@ class UserRecord(Base):
 
     id: Mapped[str] = mapped_column(String(96), primary_key=True)
     username: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default="admin")
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

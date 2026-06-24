@@ -14,7 +14,7 @@
     "dev:web": "npm run dev --workspace @ai-sysadm/web",
     "test": "npm run test:js && npm run test:api",
     "test:js": "npm run test --workspaces",
-    "test:api": "python3 -m pytest apps/api/tests -m \"not integration\"",
+    "test:api": "PYTHONPATH=apps/api ./.venv/bin/python -m pytest apps/api/tests -m \"not integration\"",
     "test:integration": "./scripts/integration.sh test",
     "test:integration:cleanup": "./scripts/integration.sh cleanup"
   }
