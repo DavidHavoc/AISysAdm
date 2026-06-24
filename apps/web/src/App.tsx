@@ -20,6 +20,7 @@ import type {
   User
 } from "@ai-sysadm/shared";
 import { api } from "./api.js";
+import type { OperationsHealth } from "./api.js";
 
 type HostFormState = {
   name: string;
@@ -49,11 +50,23 @@ type LogFilters = {
   agentRunId: string;
   severity: string;
   source: string;
+  phaseId: string;
+  taskId: string;
   page: number;
   pageSize: number;
 };
 
 type DashboardView = "fleet" | "operations" | "campaigns" | "evidence";
+type OperationsSection = "health" | "jobs" | "logs" | "alerts" | "audit" | "agents" | "remediations";
+
+type JobFilters = {
+  status: string;
+  jobType: string;
+  hostId: string;
+  scanId: string;
+  remediationId: string;
+  campaignId: string;
+};
 
 const blankHostForm: HostFormState = {
   name: "",
@@ -87,6 +100,26 @@ const emptyLogPage: LogPage = {
   pageSize: 25
 };
 
+const emptyOperationsHealth: OperationsHealth = {
+  live: { ok: false },
+  ready: {
+    ok: false,
+    checks: {
+      database: false,
+      redis: false,
+      executionMode: "unknown",
+      collectorMode: "unknown"
+    }
+  },
+  ops: {
+    ok: false,
+    checks: {
+      worker: { healthy: false, lastSeenAt: null },
+      celeryBeat: { healthy: false, lastSeenAt: null }
+    }
+  }
+};
+
 export function canExecuteCampaign(campaign: PatchCampaign) {
   return campaign.hosts.some((host) => host.state === "approved");
 }
@@ -97,6 +130,71 @@ export function canApproveCampaignHost(host: CampaignHostPlan) {
     && host.planVersion !== null
     && host.planHash
   );
+}
+
+export function remediationRequiresReboot(remediation: Remediation) {
+  return remediation.rebootAssessment.status !== "not_expected";
+}
+
+export function remediationExecutionBlockers(remediation: Remediation, host?: Host | null) {
+  const blockers: string[] = [];
+  if (remediation.approvalState !== "approved") {
+    blockers.push("Patch plan approval is required.");
+  }
+  if (
+    remediation.approvalState === "approved"
+    && (
+      !remediation.approvedBy
+      || !remediation.approvedAt
+      || remediation.approvedPlanVersion === null
+      || !remediation.approvedPlanHash
+    )
+  ) {
+    blockers.push("Patch approval metadata is incomplete.");
+  }
+  if (
+    remediation.approvedPlanVersion !== null
+    && remediation.approvedPlanVersion !== remediation.planVersion
+  ) {
+    blockers.push("Patch approval is bound to an older plan version.");
+  }
+  if (
+    remediation.approvedPlanHash
+    && remediation.approvedPlanHash !== remediation.planHash
+  ) {
+    blockers.push("Patch approval is bound to an older plan hash.");
+  }
+  if (remediationRequiresReboot(remediation)) {
+    if (remediation.rebootApprovalState !== "approved") {
+      blockers.push("Separate reboot approval is required.");
+    }
+    if (
+      remediation.rebootApprovalState === "approved"
+      && (
+        !remediation.rebootApprovedBy
+        || !remediation.rebootApprovedAt
+        || remediation.rebootApprovedPlanVersion !== remediation.planVersion
+        || remediation.rebootApprovedPlanHash !== remediation.planHash
+        || !remediation.rebootAssessment.approvedIfRequired
+      )
+    ) {
+      blockers.push("Reboot approval metadata is incomplete.");
+    }
+    if (host?.patchPolicy.rebootPolicy === "never") {
+      blockers.push("Host policy forbids reboot risk.");
+    }
+  }
+  if (["queued", "running", "waiting_for_window"].includes(remediation.executionState)) {
+    blockers.push("Execution is already queued or running.");
+  }
+  if (["succeeded", "failed", "canceled"].includes(remediation.executionState)) {
+    blockers.push(`Execution is already ${remediation.executionState} for this plan.`);
+  }
+  return blockers;
+}
+
+export function canQueueRemediationExecution(remediation: Remediation, host?: Host | null) {
+  return remediationExecutionBlockers(remediation, host).length === 0;
 }
 
 export function hostFormFromHost(host: Host): HostFormState {
@@ -186,6 +284,8 @@ export function App() {
   const [credentialFile, setCredentialFile] = useState<File | null>(null);
   const [findings, setFindings] = useState<Finding[]>([]);
   const [remediations, setRemediations] = useState<Remediation[]>([]);
+  const [selectedRemediationId, setSelectedRemediationId] = useState("");
+  const [executionConfirmation, setExecutionConfirmation] = useState("");
   const [campaigns, setCampaigns] = useState<PatchCampaign[]>([]);
   const [selectedCampaignId, setSelectedCampaignId] = useState<string>("");
   const [campaignName, setCampaignName] = useState("Production patch wave");
@@ -194,9 +294,18 @@ export function App() {
   const [scheduleForm, setScheduleForm] = useState<ScheduleFormState>(defaultScheduleForm);
   const [jobs, setJobs] = useState<DurableJob[]>([]);
   const [selectedJob, setSelectedJob] = useState<DurableJob | null>(null);
+  const [jobFilters, setJobFilters] = useState<JobFilters>({
+    status: "",
+    jobType: "",
+    hostId: "",
+    scanId: "",
+    remediationId: "",
+    campaignId: ""
+  });
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [agentRuns, setAgentRuns] = useState<AgentRun[]>([]);
+  const [selectedAgentRun, setSelectedAgentRun] = useState<AgentRun | null>(null);
   const [agentMessages, setAgentMessages] = useState<AgentMessage[]>([]);
   const [agentScanId, setAgentScanId] = useState("");
   const [logs, setLogs] = useState<LogPage>(emptyLogPage);
@@ -208,10 +317,14 @@ export function App() {
     agentRunId: "",
     severity: "",
     source: "",
+    phaseId: "",
+    taskId: "",
     page: 1,
     pageSize: 25
   });
   const [selectedLog, setSelectedLog] = useState<StructuredLogEvent | null>(null);
+  const [operationsHealth, setOperationsHealth] = useState<OperationsHealth>(emptyOperationsHealth);
+  const [operationsSection, setOperationsSection] = useState<OperationsSection>("health");
   const [connectionResult, setConnectionResult] = useState<ConnectionTestResult | null>(null);
   const [pendingHostKey, setPendingHostKey] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<DashboardView>("fleet");
@@ -221,15 +334,77 @@ export function App() {
   const selectedHost = hosts.find((host) => host.id === selectedHostId) ?? null;
   const selectedSchedule = schedules.find((schedule) => schedule.hostId === selectedHostId) ?? null;
   const selectedCampaign = campaigns.find((campaign) => campaign.id === selectedCampaignId) ?? null;
+  const selectedRemediation = remediations.find((remediation) => remediation.id === selectedRemediationId)
+    ?? remediations[0]
+    ?? null;
+  const selectedRemediationHost = selectedRemediation
+    ? hosts.find((host) => host.id === selectedRemediation.hostId) ?? null
+    : null;
+  const selectedRemediationBlockers = selectedRemediation
+    ? remediationExecutionBlockers(selectedRemediation, selectedRemediationHost)
+    : [];
+  const filteredJobs = useMemo(
+    () => jobs.filter((job) =>
+      (!jobFilters.status || job.status === jobFilters.status)
+      && (!jobFilters.jobType || job.jobType === jobFilters.jobType)
+      && (!jobFilters.hostId || job.hostId === jobFilters.hostId)
+      && (!jobFilters.scanId || job.scanId === jobFilters.scanId)
+      && (!jobFilters.remediationId || job.remediationId === jobFilters.remediationId)
+      && (!jobFilters.campaignId || job.campaignId === jobFilters.campaignId)
+    ),
+    [jobs, jobFilters]
+  );
+  const actionSummary = useMemo(() => {
+    const runningJobs = jobs.filter((job) => job.status === "running").length;
+    const failedJobs = jobs.filter((job) => job.status === "failed" || job.error || job.lastFailure).length;
+    const queuedJobs = jobs.filter((job) =>
+      ["queued", "pending", "scheduled", "waiting_for_window"].includes(job.status)
+    ).length;
+    const unhealthyHealthChecks = [
+      operationsHealth.live.ok,
+      operationsHealth.ready.checks.database,
+      operationsHealth.ready.checks.redis,
+      operationsHealth.ops.checks.worker.healthy,
+      operationsHealth.ops.checks.celeryBeat.healthy
+    ].filter((item) => !item).length;
+    const failedOrExternalAgentRuns = agentRuns.filter((run) =>
+      run.status === "failed" || run.externallyProcessed
+    ).length;
+    const recentHighCriticalLogs = logs.items.filter((log) =>
+      log.severity === "high" || log.severity === "critical"
+    ).length;
+    return {
+      runningJobs,
+      failedJobs,
+      queuedJobs,
+      unacknowledgedAlerts: alerts.filter((alert) => !alert.acknowledged).length,
+      unhealthyHealthChecks,
+      failedOrExternalAgentRuns,
+      recentHighCriticalLogs
+    };
+  }, [jobs, alerts, operationsHealth, agentRuns, logs.items]);
 
   const approvedCampaignCount = useMemo(
     () => selectedCampaign?.hosts.filter((host) => host.state === "approved").length ?? 0,
     [selectedCampaign]
   );
+  const activeViewTitle = {
+    fleet: "Fleet Setup",
+    operations: "Operations",
+    campaigns: "Campaigns",
+    evidence: "Evidence"
+  }[activeView];
+  const activeViewStatus = {
+    fleet: `${hosts.length} hosts`,
+    operations: `${actionSummary.failedJobs} failed, ${actionSummary.unacknowledgedAlerts} alerts`,
+    campaigns: `${campaigns.length} campaigns`,
+    evidence: `${logs.total} logs`
+  }[activeView];
 
   async function refresh() {
     try {
       const [
+        nextOperationsHealth,
         nextCredentials,
         nextHosts,
         nextRemediations,
@@ -241,6 +416,7 @@ export function App() {
         nextAgentRuns,
         nextLogs
       ] = await Promise.all([
+        api.getOperationsHealth(),
         api.listCredentials(),
         api.listHosts(),
         api.listRemediations(),
@@ -252,6 +428,7 @@ export function App() {
         api.listAgentRuns(agentScanId || undefined),
         api.listLogs(logFilters)
       ]);
+      setOperationsHealth(nextOperationsHealth);
       setCredentials(nextCredentials);
       setHosts(nextHosts);
       setRemediations(nextRemediations);
@@ -279,6 +456,11 @@ export function App() {
         current && nextCampaigns.some((campaign) => campaign.id === current)
           ? current
           : nextCampaigns[0]?.id ?? ""
+      );
+      setSelectedRemediationId((current) =>
+        current && nextRemediations.some((remediation) => remediation.id === current)
+          ? current
+          : nextRemediations[0]?.id ?? ""
       );
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Unknown dashboard error");
@@ -309,6 +491,10 @@ export function App() {
     if (!selectedHost || editingHostId) return;
     setHostForm(hostFormFromHost(selectedHost));
   }, [selectedHost, editingHostId]);
+
+  useEffect(() => {
+    setExecutionConfirmation("");
+  }, [selectedRemediationId]);
 
   async function act(key: string, action: () => Promise<unknown>) {
     setBusy(key);
@@ -345,8 +531,10 @@ export function App() {
     setAlerts([]);
     setAuditEvents([]);
     setAgentRuns([]);
+    setSelectedAgentRun(null);
     setAgentMessages([]);
     setLogs(emptyLogPage);
+    setOperationsHealth(emptyOperationsHealth);
   }
 
   async function chooseHost(hostId: string) {
@@ -453,6 +641,28 @@ export function App() {
     );
   }
 
+  async function queueRemediationExecution(remediation: Remediation) {
+    const host = hosts.find((item) => item.id === remediation.hostId);
+    const blockers = remediationExecutionBlockers(remediation, host);
+    if (!host) {
+      setError("The remediation host is no longer available.");
+      return;
+    }
+    if (blockers.length > 0) {
+      setError(blockers[0]);
+      return;
+    }
+    if (executionConfirmation !== host.name) {
+      setError(`Type ${host.name} before queueing execution.`);
+      return;
+    }
+    await act(`execute-${remediation.id}`, async () => {
+      const job = await api.executeRemediation(remediation.id);
+      setSelectedJob(job);
+      setExecutionConfirmation("");
+    });
+  }
+
   async function createCampaign(event: FormEvent) {
     event.preventDefault();
     await act("campaign-create", async () => {
@@ -512,6 +722,26 @@ export function App() {
     });
   }
 
+  async function applyLogFilters(nextFilters: Partial<LogFilters>) {
+    const next = { ...logFilters, ...nextFilters, page: 1 };
+    setLogFilters(next);
+    setOperationsSection("logs");
+    await act("logs-load", async () => {
+      setLogs(await api.listLogs(next));
+    });
+  }
+
+  async function applyAgentScan(scanId: string) {
+    setAgentScanId(scanId);
+    setOperationsSection("agents");
+    await act("agent-load", async () => {
+      const nextRuns = await api.listAgentRuns(scanId);
+      setAgentRuns(nextRuns);
+      setAgentMessages(await api.listAgentMessages(scanId));
+      setSelectedAgentRun(nextRuns[0] ?? null);
+    });
+  }
+
   async function openLog(id: string) {
     await act(`log-${id}`, async () => {
       setSelectedLog(await api.getLog(id));
@@ -520,8 +750,10 @@ export function App() {
 
   async function loadAgentActivity(scanId = agentScanId) {
     await act("agent-load", async () => {
-      setAgentRuns(await api.listAgentRuns(scanId || undefined));
+      const nextRuns = await api.listAgentRuns(scanId || undefined);
+      setAgentRuns(nextRuns);
       setAgentMessages(scanId ? await api.listAgentMessages(scanId) : []);
+      setSelectedAgentRun(nextRuns[0] ?? null);
     });
   }
 
@@ -586,37 +818,51 @@ export function App() {
         <Metric label="Alerts" value={alerts.filter((alert) => !alert.acknowledged).length} detail="unacknowledged" />
       </section>
 
-      <nav className="workspace-tabs" aria-label="Dashboard sections">
-        <button
-          className={activeView === "fleet" ? "tab-button active" : "tab-button"}
-          onClick={() => setActiveView("fleet")}
-        >
-          Fleet
-        </button>
-        <button
-          className={activeView === "operations" ? "tab-button active" : "tab-button"}
-          onClick={() => setActiveView("operations")}
-        >
-          Work Queue
-        </button>
-        <button
-          className={activeView === "campaigns" ? "tab-button active" : "tab-button"}
-          onClick={() => setActiveView("campaigns")}
-        >
-          Campaigns
-        </button>
-        <button
-          className={activeView === "evidence" ? "tab-button active" : "tab-button"}
-          onClick={() => setActiveView("evidence")}
-        >
-          Evidence
-        </button>
-      </nav>
+      <section className="operator-layout">
+        <nav className="workspace-nav" aria-label="Dashboard sections">
+          <button
+            className={activeView === "fleet" ? "nav-button active" : "nav-button"}
+            onClick={() => setActiveView("fleet")}
+          >
+            <strong>Fleet Setup</strong>
+            <small>{hosts.length} hosts, {credentials.length} keys</small>
+          </button>
+          <button
+            className={activeView === "operations" ? "nav-button active" : "nav-button"}
+            onClick={() => setActiveView("operations")}
+          >
+            <strong>Operations</strong>
+            <small>{jobs.length} jobs, {alerts.filter((alert) => !alert.acknowledged).length} alerts</small>
+          </button>
+          <button
+            className={activeView === "campaigns" ? "nav-button active" : "nav-button"}
+            onClick={() => setActiveView("campaigns")}
+          >
+            <strong>Campaigns</strong>
+            <small>{campaigns.length} waves</small>
+          </button>
+          <button
+            className={activeView === "evidence" ? "nav-button active" : "nav-button"}
+            onClick={() => setActiveView("evidence")}
+          >
+            <strong>Evidence</strong>
+            <small>{logs.total} logs, {alerts.length} alerts</small>
+          </button>
+        </nav>
 
-      <section className="dashboard-grid">
+        <section className="workspace-content">
+          <header className="workspace-heading">
+            <div>
+              <p className="eyebrow">Workspace</p>
+              <h2>{activeViewTitle}</h2>
+            </div>
+            <span className="status-chip">{activeViewStatus}</span>
+          </header>
+
+      <section className={`dashboard-grid dashboard-${activeView}`}>
         {activeView === "fleet" ? (
           <>
-        <Panel title="SSH Credentials">
+        <SecondaryPanel title="SSH Keys">
           <form className="inline-form" onSubmit={(event) => void uploadCredential(event)}>
             <input
               aria-label="Credential name"
@@ -652,7 +898,7 @@ export function App() {
               </div>
             ))}
           </div>
-        </Panel>
+        </SecondaryPanel>
 
         <Panel title="Hosts">
           <form className="form-grid" onSubmit={(event) => void submitHost(event)}>
@@ -826,7 +1072,7 @@ export function App() {
           ) : null}
         </Panel>
 
-        <Panel title="Schedules">
+        <SecondaryPanel title="Scan Schedule">
           {!selectedHost ? <p>Select a host to edit its schedule.</p> : null}
           {selectedHost ? (
             <form className="form-grid" onSubmit={(event) => {
@@ -875,109 +1121,57 @@ export function App() {
               </div>
             ))}
           </div>
-        </Panel>
+        </SecondaryPanel>
           </>
         ) : null}
 
         {activeView === "operations" ? (
-          <>
-        <Panel title="Findings">
-          <div className="panel-actions">
-            {selectedHost ? (
-              <button className="secondary-button" onClick={() => void runScan(selectedHost.id)}>
-                {busy === `scan-${selectedHost.id}` ? "Scanning..." : "Run Scan"}
-              </button>
-            ) : null}
-          </div>
-          {findings.length === 0 ? <p>No findings for the selected host.</p> : null}
-          <div className="list-stack">
-            {findings.map((finding) => (
-              <div key={finding.id} className="record-block">
-                <div className="chip-row">
-                  <span className={`severity severity-${finding.severity}`}>{finding.severity}</span>
-                  <span className="status-chip">{finding.sourceAgent.replaceAll("_", " ")}</span>
-                  <span className="status-chip">{finding.verifierStatus}</span>
-                </div>
-                <h3>{finding.summary}</h3>
-                <p>{finding.explanation}</p>
-                {finding.evidence.map((item) => (
-                  <blockquote key={item.citation}>
-                    {item.excerpt}
-                    <footer>{item.source}</footer>
-                  </blockquote>
-                ))}
-              </div>
-            ))}
-          </div>
-        </Panel>
-
-        <Panel title="Remediations">
-          {remediations.length === 0 ? <p>No remediations queued.</p> : null}
-          <div className="list-stack">
-            {remediations.map((remediation) => (
-              <div key={remediation.id} className="record-block">
-                <div className="chip-row">
-                  <span className={`severity severity-${remediation.riskLevel}`}>{remediation.riskLevel}</span>
-                  <span className={statusClass(remediation.approvalState)}>approval {remediation.approvalState}</span>
-                  <span className={statusClass(remediation.rebootApprovalState)}>reboot {remediation.rebootApprovalState}</span>
-                  <span className={statusClass(remediation.executionState)}>{remediation.executionState}</span>
-                </div>
-                <h3>{remediation.title}</h3>
-                <p>{remediation.aiDecision.explanation}</p>
-                <div className="detail-grid">
-                  <div><dt>Host</dt><dd>{hostLabel(hosts, remediation.hostId)}</dd></div>
-                  <div><dt>Plan version</dt><dd>{remediation.planVersion}</dd></div>
-                  <div><dt>Plan hash</dt><dd>{remediation.planHash}</dd></div>
-                  <div><dt>Reboot</dt><dd>{remediation.rebootAssessment.status.replaceAll("_", " ")}</dd></div>
-                  <div><dt>Downtime</dt><dd>{remediation.rebootAssessment.estimatedDowntimeMinutes} min</dd></div>
-                  <div><dt>Rollout</dt><dd>{remediation.rolloutPolicy.strategy.replaceAll("_", " ")}</dd></div>
-                </div>
-                <p className="muted-text">{remediation.rebootAssessment.rationale}</p>
-                <div className="model-list">
-                  {remediation.aiDecision.agentAssignments.map((agent) => (
-                    <span key={agent.name}>
-                      {agent.name.replaceAll("_", " ")}: {agent.provider}/{agent.model} ({agent.modelTier})
-                    </span>
-                  ))}
-                </div>
-                <div className="action-row">
-                  <button
-                    className="primary-button"
-                    disabled={remediation.approvalState !== "pending"}
-                    onClick={() => void approveRemediation(remediation)}
-                  >
-                    Approve Patch
-                  </button>
-                  <button
-                    className="secondary-button"
-                    disabled={remediation.rebootApprovalState !== "pending"}
-                    onClick={() => void approveRemediationReboot(remediation)}
-                  >
-                    Approve Reboot
-                  </button>
-                  <button
-                    className="secondary-button"
-                    disabled={remediation.approvalState !== "pending"}
-                    onClick={() => void act(`reject-${remediation.id}`, () => api.rejectRemediation(remediation.id))}
-                  >
-                    Reject
-                  </button>
-                  <button
-                    className="primary-button"
-                    disabled={remediation.approvalState !== "approved" || remediation.executionState === "running"}
-                    onClick={() => void act(`execute-${remediation.id}`, () => api.executeRemediation(remediation.id))}
-                  >
-                    Execute
-                  </button>
-                </div>
-                {remediation.result ? (
-                  <pre>{JSON.stringify(remediation.result, null, 2)}</pre>
-                ) : null}
-              </div>
-            ))}
-          </div>
-        </Panel>
-          </>
+          <OperationsView
+            health={operationsHealth}
+            section={operationsSection}
+            setSection={setOperationsSection}
+            summary={actionSummary}
+            jobs={filteredJobs}
+            allJobs={jobs}
+            jobFilters={jobFilters}
+            setJobFilters={setJobFilters}
+            selectedJob={selectedJob}
+            loadJob={loadJob}
+            logs={logs}
+            logFilters={logFilters}
+            setLogFilters={setLogFilters}
+            loadLogs={loadLogs}
+            applyLogFilters={applyLogFilters}
+            selectedLog={selectedLog}
+            openLog={openLog}
+            alerts={alerts}
+            acknowledgeAlert={(alertId) => act(`alert-${alertId}`, () => api.acknowledgeAlert(alertId))}
+            auditEvents={auditEvents}
+            agentRuns={agentRuns}
+            agentMessages={agentMessages}
+            agentScanId={agentScanId}
+            setAgentScanId={setAgentScanId}
+            selectedAgentRun={selectedAgentRun}
+            setSelectedAgentRun={setSelectedAgentRun}
+            loadAgentActivity={loadAgentActivity}
+            applyAgentScan={applyAgentScan}
+            findings={findings}
+            selectedHost={selectedHost}
+            runScan={runScan}
+            busy={busy}
+            remediations={remediations}
+            hosts={hosts}
+            selectedRemediation={selectedRemediation}
+            selectedRemediationHost={selectedRemediationHost}
+            selectedRemediationBlockers={selectedRemediationBlockers}
+            setSelectedRemediationId={setSelectedRemediationId}
+            executionConfirmation={executionConfirmation}
+            setExecutionConfirmation={setExecutionConfirmation}
+            approveRemediation={approveRemediation}
+            approveRemediationReboot={approveRemediationReboot}
+            rejectRemediation={(remediationId) => act(`reject-${remediationId}`, () => api.rejectRemediation(remediationId))}
+            queueRemediationExecution={queueRemediationExecution}
+          />
         ) : null}
 
         {activeView === "campaigns" ? (
@@ -1109,27 +1303,6 @@ export function App() {
           </>
         ) : null}
 
-        {activeView === "operations" ? (
-          <>
-        <Panel title="Jobs">
-          <div className="list-stack">
-            {jobs.map((job) => (
-              <button key={job.id} className="record-row host-selector" onClick={() => void loadJob(job.id)}>
-                <span>
-                  <strong>{job.jobType}</strong>
-                  <small>{job.status} / {job.progressPercent}% / {job.currentPhase ?? "no phase"}</small>
-                  <small>Attempts {job.attempts}/{job.maxAttempts} / host {hostLabel(hosts, job.hostId)}</small>
-                  {job.lastFailure ? <small className="warning-text">{job.lastFailure.category}: {job.lastFailure.message}</small> : null}
-                  {job.error ? <small className="warning-text">{job.error}</small> : null}
-                </span>
-              </button>
-            ))}
-          </div>
-          {selectedJob ? <pre>{JSON.stringify(selectedJob, null, 2)}</pre> : null}
-        </Panel>
-          </>
-        ) : null}
-
         {activeView === "evidence" ? (
           <>
         <Panel title="Logs">
@@ -1177,7 +1350,7 @@ export function App() {
           {selectedLog ? <pre>{JSON.stringify(selectedLog, null, 2)}</pre> : null}
         </Panel>
 
-        <Panel title="Alerts And Audit">
+        <SecondaryPanel title="Alerts And Audit">
           <div className="split-grid">
             <div className="list-stack">
               <h3>Alerts</h3>
@@ -1216,9 +1389,9 @@ export function App() {
               ))}
             </div>
           </div>
-        </Panel>
+        </SecondaryPanel>
 
-        <Panel title="Agent Activity">
+        <SecondaryPanel title="Agent Activity">
           <form className="inline-form" onSubmit={(event) => {
             event.preventDefault();
             void loadAgentActivity();
@@ -1263,11 +1436,677 @@ export function App() {
               ))}
             </div>
           ) : null}
-        </Panel>
+        </SecondaryPanel>
           </>
         ) : null}
       </section>
+        </section>
+      </section>
     </main>
+  );
+}
+
+function OperationsView(props: {
+  health: OperationsHealth;
+  section: OperationsSection;
+  setSection: (section: OperationsSection) => void;
+  summary: {
+    runningJobs: number;
+    failedJobs: number;
+    queuedJobs: number;
+    unacknowledgedAlerts: number;
+    unhealthyHealthChecks: number;
+    failedOrExternalAgentRuns: number;
+    recentHighCriticalLogs: number;
+  };
+  jobs: DurableJob[];
+  allJobs: DurableJob[];
+  jobFilters: JobFilters;
+  setJobFilters: (filters: JobFilters) => void;
+  selectedJob: DurableJob | null;
+  loadJob: (jobId: string) => Promise<void>;
+  logs: LogPage;
+  logFilters: LogFilters;
+  setLogFilters: (filters: LogFilters) => void;
+  loadLogs: (page?: number) => Promise<void>;
+  applyLogFilters: (filters: Partial<LogFilters>) => Promise<void>;
+  selectedLog: StructuredLogEvent | null;
+  openLog: (logId: string) => Promise<void>;
+  alerts: Alert[];
+  acknowledgeAlert: (alertId: string) => Promise<unknown>;
+  auditEvents: AuditEvent[];
+  agentRuns: AgentRun[];
+  agentMessages: AgentMessage[];
+  agentScanId: string;
+  setAgentScanId: (scanId: string) => void;
+  selectedAgentRun: AgentRun | null;
+  setSelectedAgentRun: (run: AgentRun | null) => void;
+  loadAgentActivity: (scanId?: string) => Promise<void>;
+  applyAgentScan: (scanId: string) => Promise<void>;
+  findings: Finding[];
+  selectedHost: Host | null;
+  runScan: (hostId: string) => Promise<void>;
+  busy: string;
+  remediations: Remediation[];
+  hosts: Host[];
+  selectedRemediation: Remediation | null;
+  selectedRemediationHost: Host | null;
+  selectedRemediationBlockers: string[];
+  setSelectedRemediationId: (remediationId: string) => void;
+  executionConfirmation: string;
+  setExecutionConfirmation: (value: string) => void;
+  approveRemediation: (remediation: Remediation) => Promise<void>;
+  approveRemediationReboot: (remediation: Remediation) => Promise<void>;
+  rejectRemediation: (remediationId: string) => Promise<unknown>;
+  queueRemediationExecution: (remediation: Remediation) => Promise<void>;
+}) {
+  const jobStatuses = Array.from(new Set(props.allJobs.map((job) => job.status))).sort();
+  const jobTypes = Array.from(new Set(props.allJobs.map((job) => job.jobType))).sort();
+  const pageCount = Math.max(1, Math.ceil(props.logs.total / props.logs.pageSize));
+
+  async function pivotToScan(scanId: string | null | undefined) {
+    if (!scanId) return;
+    await props.applyLogFilters({ scanId });
+    await props.applyAgentScan(scanId);
+  }
+
+  async function pivotToHost(hostId: string | null | undefined) {
+    if (!hostId) return;
+    props.setJobFilters({ ...props.jobFilters, hostId });
+    await props.applyLogFilters({ hostId });
+  }
+
+  function linkButton(label: string, value: string | null | undefined, action: () => void) {
+    if (!value) return <span>None</span>;
+    return (
+      <button className="link-button" type="button" onClick={action}>
+        {label || value}
+      </button>
+    );
+  }
+
+  return (
+    <div className="operations-shell">
+      <section className="ops-summary" aria-label="Operations action summary">
+        <Metric label="Running" value={props.summary.runningJobs} detail="jobs" />
+        <Metric label="Failed" value={props.summary.failedJobs} detail="jobs" />
+        <Metric label="Queued" value={props.summary.queuedJobs} detail="jobs" />
+        <Metric label="Alerts" value={props.summary.unacknowledgedAlerts} detail="unacknowledged" />
+        <Metric label="Unhealthy" value={props.summary.unhealthyHealthChecks} detail="checks" />
+        <Metric label="Agents" value={props.summary.failedOrExternalAgentRuns} detail="failed or external" />
+        <Metric label="High Logs" value={props.summary.recentHighCriticalLogs} detail="current page" />
+      </section>
+
+      <nav className="segmented-nav" aria-label="Operations panels">
+        {[
+          ["health", "Health"],
+          ["jobs", "Jobs"],
+          ["logs", "Logs"],
+          ["alerts", "Alerts"],
+          ["audit", "Audit"],
+          ["agents", "Agents"],
+          ["remediations", "Remediations"]
+        ].map(([key, label]) => (
+          <button
+            key={key}
+            className={props.section === key ? "segment-button active" : "segment-button"}
+            onClick={() => props.setSection(key as OperationsSection)}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
+
+      {props.section === "health" ? (
+        <Panel title="Health Overview">
+          <div className="detail-grid">
+            <HealthCell label="API live" healthy={props.health.live.ok} detail={props.health.live.ok ? "responding" : "not responding"} />
+            <HealthCell label="Database" healthy={props.health.ready.checks.database} detail="readiness" />
+            <HealthCell label="Redis" healthy={props.health.ready.checks.redis} detail="readiness" />
+            <HealthCell label="Collector mode" healthy detail={props.health.ready.checks.collectorMode} />
+            <HealthCell label="Execution mode" healthy detail={props.health.ready.checks.executionMode} />
+            <HealthCell
+              label="Worker heartbeat"
+              healthy={props.health.ops.checks.worker.healthy}
+              detail={`last seen ${formatDate(props.health.ops.checks.worker.lastSeenAt)}`}
+            />
+            <HealthCell
+              label="Celery Beat heartbeat"
+              healthy={props.health.ops.checks.celeryBeat.healthy}
+              detail={`last seen ${formatDate(props.health.ops.checks.celeryBeat.lastSeenAt)}`}
+            />
+          </div>
+        </Panel>
+      ) : null}
+
+      {props.section === "jobs" ? (
+        <Panel title="Jobs">
+          <form className="form-grid" onSubmit={(event) => event.preventDefault()}>
+            <label>
+              Status
+              <select
+                value={props.jobFilters.status}
+                onChange={(event) => props.setJobFilters({ ...props.jobFilters, status: event.target.value })}
+              >
+                <option value="">any status</option>
+                {jobStatuses.map((status) => <option key={status} value={status}>{status}</option>)}
+              </select>
+            </label>
+            <label>
+              Job type
+              <select
+                value={props.jobFilters.jobType}
+                onChange={(event) => props.setJobFilters({ ...props.jobFilters, jobType: event.target.value })}
+              >
+                <option value="">any type</option>
+                {jobTypes.map((type) => <option key={type} value={type}>{type}</option>)}
+              </select>
+            </label>
+            <label>
+              Host ID
+              <input value={props.jobFilters.hostId} onChange={(event) => props.setJobFilters({ ...props.jobFilters, hostId: event.target.value })} />
+            </label>
+            <label>
+              Scan ID
+              <input value={props.jobFilters.scanId} onChange={(event) => props.setJobFilters({ ...props.jobFilters, scanId: event.target.value })} />
+            </label>
+            <label>
+              Remediation ID
+              <input value={props.jobFilters.remediationId} onChange={(event) => props.setJobFilters({ ...props.jobFilters, remediationId: event.target.value })} />
+            </label>
+            <label>
+              Campaign ID
+              <input value={props.jobFilters.campaignId} onChange={(event) => props.setJobFilters({ ...props.jobFilters, campaignId: event.target.value })} />
+            </label>
+            <button className="secondary-button" type="button" onClick={() => props.setJobFilters({ status: "", jobType: "", hostId: "", scanId: "", remediationId: "", campaignId: "" })}>
+              Clear
+            </button>
+          </form>
+          {props.jobs.length === 0 ? <p>No jobs match the current filters.</p> : null}
+          <div className="table-scroll">
+            <table className="ops-table">
+              <thead>
+                <tr>
+                  <th>Job</th>
+                  <th>Status</th>
+                  <th>Related IDs</th>
+                  <th>Progress</th>
+                  <th>Lease</th>
+                  <th>Failure</th>
+                  <th>Times</th>
+                </tr>
+              </thead>
+              <tbody>
+                {props.jobs.map((job) => (
+                  <tr key={job.id}>
+                    <td>
+                      <button className="link-button strong-link" onClick={() => void props.loadJob(job.id)}>{job.id}</button>
+                      <small>{job.jobType}</small>
+                    </td>
+                    <td><span className={statusClass(job.status)}>{job.status}</span></td>
+                    <td>
+                      <small>host {linkButton(job.hostId ?? "", job.hostId, () => {
+                        void pivotToHost(job.hostId);
+                      })}</small>
+                      <small>scan {linkButton(job.scanId ?? "", job.scanId, () => void pivotToScan(job.scanId))}</small>
+                      <small>rem {linkButton(job.remediationId ?? "", job.remediationId, () => void props.applyLogFilters({ remediationId: job.remediationId ?? "" }))}</small>
+                      <small>campaign {textValue(job.campaignId)}</small>
+                    </td>
+                    <td>
+                      <strong>{job.progressPercent}%</strong>
+                      <small>{job.currentPhase ?? "no phase"}</small>
+                      <small>{job.attempts}/{job.maxAttempts} attempts</small>
+                    </td>
+                    <td>
+                      <small>{textValue(job.leaseOwner)}</small>
+                      <small>heartbeat {formatDate(job.heartbeatAt)}</small>
+                      <small>expires {formatDate(job.leaseExpiresAt)}</small>
+                    </td>
+                    <td>
+                      {job.lastFailure ? (
+                        <>
+                          <small className="warning-text">{job.lastFailure.category}</small>
+                          <small>{job.lastFailure.message}</small>
+                          <small>{job.lastFailure.retryable ? "retryable" : "not retryable"} / {formatDate(job.lastFailure.failedAt)}</small>
+                        </>
+                      ) : <small>None</small>}
+                      {job.error ? <small className="warning-text">{job.error}</small> : null}
+                    </td>
+                    <td>
+                      <small>created {formatDate(job.createdAt)}</small>
+                      <small>updated {formatDate(job.updatedAt)}</small>
+                      <small>completed {formatDate(job.completedAt)}</small>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {props.selectedJob ? (
+            <div className="detail-block">
+              <div className="chip-row">
+                <span className={statusClass(props.selectedJob.status)}>{props.selectedJob.status}</span>
+                <span className="status-chip">{props.selectedJob.jobType}</span>
+                {props.selectedJob.lastFailure ? <span className="status-chip status-failed">last failure</span> : null}
+              </div>
+              <div className="action-row">
+                <button className="secondary-button" onClick={() => void props.applyLogFilters({ jobId: props.selectedJob?.id ?? "" })}>
+                  Related Logs
+                </button>
+                {props.selectedJob.scanId ? (
+                  <button className="secondary-button" onClick={() => void props.applyAgentScan(props.selectedJob?.scanId ?? "")}>
+                    Scan Agents
+                  </button>
+                ) : null}
+              </div>
+              <pre>{JSON.stringify(props.selectedJob.result, null, 2)}</pre>
+            </div>
+          ) : null}
+        </Panel>
+      ) : null}
+
+      {props.section === "logs" ? (
+        <Panel title="Logs">
+          <form className="form-grid" onSubmit={(event) => {
+            event.preventDefault();
+            void props.loadLogs(1);
+          }}>
+            <label>Host ID<input value={props.logFilters.hostId} onChange={(event) => props.setLogFilters({ ...props.logFilters, hostId: event.target.value })} /></label>
+            <label>Job ID<input value={props.logFilters.jobId} onChange={(event) => props.setLogFilters({ ...props.logFilters, jobId: event.target.value })} /></label>
+            <label>Scan ID<input value={props.logFilters.scanId} onChange={(event) => props.setLogFilters({ ...props.logFilters, scanId: event.target.value })} /></label>
+            <label>Remediation ID<input value={props.logFilters.remediationId} onChange={(event) => props.setLogFilters({ ...props.logFilters, remediationId: event.target.value })} /></label>
+            <label>Agent run ID<input value={props.logFilters.agentRunId} onChange={(event) => props.setLogFilters({ ...props.logFilters, agentRunId: event.target.value })} /></label>
+            <label>Phase ID<input value={props.logFilters.phaseId} onChange={(event) => props.setLogFilters({ ...props.logFilters, phaseId: event.target.value })} /></label>
+            <label>Task ID<input value={props.logFilters.taskId} onChange={(event) => props.setLogFilters({ ...props.logFilters, taskId: event.target.value })} /></label>
+            <label>
+              Severity
+              <select value={props.logFilters.severity} onChange={(event) => props.setLogFilters({ ...props.logFilters, severity: event.target.value })}>
+                <option value="">any severity</option>
+                <option value="info">info</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+                <option value="critical">critical</option>
+              </select>
+            </label>
+            <label>Source<input value={props.logFilters.source} onChange={(event) => props.setLogFilters({ ...props.logFilters, source: event.target.value })} /></label>
+            <label>
+              Page size
+              <select value={props.logFilters.pageSize} onChange={(event) => props.setLogFilters({ ...props.logFilters, pageSize: Number(event.target.value) })}>
+                <option value={25}>25</option>
+                <option value={50}>50</option>
+                <option value={100}>100</option>
+              </select>
+            </label>
+            <button className="primary-button" type="submit">Filter Logs</button>
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={() => {
+                props.setLogFilters({ hostId: "", jobId: "", scanId: "", remediationId: "", agentRunId: "", severity: "", source: "", phaseId: "", taskId: "", page: 1, pageSize: 25 });
+              }}
+            >
+              Clear
+            </button>
+          </form>
+          <div className="pager-row">
+            <button className="secondary-button" disabled={props.logs.page <= 1} onClick={() => void props.loadLogs(props.logs.page - 1)}>Previous</button>
+            <span>Page {props.logs.page} / {pageCount}</span>
+            <button className="secondary-button" disabled={props.logs.page >= pageCount} onClick={() => void props.loadLogs(props.logs.page + 1)}>Next</button>
+          </div>
+          {props.logs.items.length === 0 ? <p>No logs match the current filters.</p> : null}
+          <div className="table-scroll">
+            <table className="ops-table">
+              <thead>
+                <tr>
+                  <th>Timestamp</th>
+                  <th>Severity</th>
+                  <th>Event</th>
+                  <th>Source</th>
+                  <th>Related IDs</th>
+                  <th>Output Flags</th>
+                </tr>
+              </thead>
+              <tbody>
+                {props.logs.items.map((log) => (
+                  <tr key={log.id}>
+                    <td><button className="link-button" onClick={() => void props.openLog(log.id)}>{formatDate(log.timestamp)}</button></td>
+                    <td><span className={`severity severity-${log.severity}`}>{log.severity}</span></td>
+                    <td>
+                      <strong>{log.eventType}</strong>
+                      <small>{log.evidenceCategory} / {log.status}</small>
+                      <small>{log.commandDescription ?? "no command description"}</small>
+                      <small>{log.failureClassification ?? "no failure classification"}</small>
+                    </td>
+                    <td>
+                      <small>{log.source}</small>
+                      <small>changed {String(log.changed)} / simulated {String(log.simulated)}</small>
+                    </td>
+                    <td>
+                      <small>host {linkButton(log.hostId ?? "", log.hostId, () => void props.applyLogFilters({ hostId: log.hostId ?? "" }))}</small>
+                      <small>job {linkButton(log.jobId ?? "", log.jobId, () => void props.applyLogFilters({ jobId: log.jobId ?? "" }))}</small>
+                      <small>scan {linkButton(log.scanId ?? "", log.scanId, () => void pivotToScan(log.scanId))}</small>
+                      <small>rem {linkButton(log.remediationId ?? "", log.remediationId, () => void props.applyLogFilters({ remediationId: log.remediationId ?? "" }))}</small>
+                    </td>
+                    <td>
+                      <div className="chip-row">
+                        {log.redacted ? <span className="status-chip status-pending">redacted</span> : null}
+                        {log.truncated ? <span className="status-chip status-pending">truncated</span> : null}
+                        {log.externallyProcessed ? <span className="status-chip status-open">external</span> : null}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {props.selectedLog ? (
+            <div className="detail-block">
+              <div className="detail-grid">
+                <div><dt>Duration</dt><dd>{props.selectedLog.durationMs} ms</dd></div>
+                <div><dt>Return code</dt><dd>{textValue(props.selectedLog.returnCode)}</dd></div>
+                <div><dt>Retry count</dt><dd>{props.selectedLog.retryCount}</dd></div>
+                <div><dt>Reboot relevance</dt><dd>{props.selectedLog.rebootRelevance}</dd></div>
+                <div><dt>Remediation relevance</dt><dd>{props.selectedLog.remediationRelevance}</dd></div>
+                <div><dt>Correlation IDs</dt><dd>{JSON.stringify(props.selectedLog.correlationIds)}</dd></div>
+              </div>
+              <div className="split-grid">
+                <OutputBlock title="stdout" value={props.selectedLog.stdout} />
+                <OutputBlock title="stderr" value={props.selectedLog.stderr} />
+                <OutputBlock title="rawOutput" value={props.selectedLog.rawOutput} />
+                <OutputBlock title="beforeValue" value={props.selectedLog.beforeValue} />
+                <OutputBlock title="afterValue" value={props.selectedLog.afterValue} />
+              </div>
+            </div>
+          ) : null}
+        </Panel>
+      ) : null}
+
+      {props.section === "alerts" ? (
+        <Panel title="Alerts">
+          {props.alerts.length === 0 ? <p>No alerts.</p> : null}
+          <div className="list-stack">
+            {props.alerts.map((alert) => (
+              <div key={alert.id} className="record-row">
+                <div>
+                  <div className="chip-row">
+                    <span className={`severity severity-${alert.severity}`}>{alert.severity}</span>
+                    <span className={statusClass(alert.acknowledged ? "acknowledged" : "open")}>{alert.acknowledged ? "acknowledged" : "open"}</span>
+                  </div>
+                  <strong>{alert.title}</strong>
+                  <small>{alert.message}</small>
+                  <small>host {linkButton(alert.hostId ?? "", alert.hostId, () => void pivotToHost(alert.hostId))} / job {linkButton(alert.jobId ?? "", alert.jobId, () => void props.applyLogFilters({ jobId: alert.jobId ?? "" }))}</small>
+                  <small>created {formatDate(alert.createdAt)} / acknowledged {formatDate(alert.acknowledgedAt)}</small>
+                </div>
+                <button className="secondary-button" disabled={alert.acknowledged} onClick={() => void props.acknowledgeAlert(alert.id)}>
+                  Acknowledge
+                </button>
+              </div>
+            ))}
+          </div>
+        </Panel>
+      ) : null}
+
+      {props.section === "audit" ? (
+        <Panel title="Audit">
+          {props.auditEvents.length === 0 ? <p>No audit events.</p> : null}
+          <div className="list-stack">
+            {props.auditEvents.map((event) => (
+              <div key={event.id} className="record-block">
+                <div className="detail-grid">
+                  <div><dt>Actor</dt><dd>{event.actor}</dd></div>
+                  <div><dt>Action</dt><dd>{event.action}</dd></div>
+                  <div><dt>Target</dt><dd>{event.targetType} / {textValue(event.targetId)}</dd></div>
+                  <div><dt>Created</dt><dd>{formatDate(event.createdAt)}</dd></div>
+                </div>
+                <pre>{JSON.stringify(event.details, null, 2)}</pre>
+              </div>
+            ))}
+          </div>
+        </Panel>
+      ) : null}
+
+      {props.section === "agents" ? (
+        <Panel title="Agent Activity">
+          <form className="inline-form" onSubmit={(event) => {
+            event.preventDefault();
+            void props.loadAgentActivity();
+          }}>
+            <input aria-label="Agent scan ID" placeholder="scanId" value={props.agentScanId} onChange={(event) => props.setAgentScanId(event.target.value)} />
+            <button className="primary-button" type="submit">Load</button>
+          </form>
+          {props.agentRuns.length === 0 ? <p>No agent runs match the current scan filter.</p> : null}
+          <div className="table-scroll">
+            <table className="ops-table">
+              <thead>
+                <tr>
+                  <th>Scan</th>
+                  <th>Agent</th>
+                  <th>Model</th>
+                  <th>Status</th>
+                  <th>Tokens</th>
+                  <th>Processing</th>
+                </tr>
+              </thead>
+              <tbody>
+                {props.agentRuns.map((run) => (
+                  <tr key={run.id}>
+                    <td><button className="link-button" onClick={() => void props.applyAgentScan(run.scanId)}>{run.scanId}</button></td>
+                    <td>
+                      <strong>{run.agent.name.replaceAll("_", " ")}</strong>
+                      <small>{run.agent.responsibility}</small>
+                    </td>
+                    <td>
+                      <small>{run.agent.provider}/{run.agent.model}</small>
+                      <small>{run.agent.modelTier}</small>
+                      <small>{run.inputHash}</small>
+                    </td>
+                    <td><span className={statusClass(run.status)}>{run.status}</span></td>
+                    <td>
+                      <small>prompt {run.promptTokens}</small>
+                      <small>completion {run.completionTokens}</small>
+                      <small>latency {run.latencyMs} ms</small>
+                      <small>created {formatDate(run.createdAt)}</small>
+                    </td>
+                    <td>
+                      <small>{run.cacheHit ? "cache hit" : "cache miss"}</small>
+                      <small>{run.fallbackReason ?? "no fallback"}</small>
+                      <small>{run.externallyProcessed ? "externally processed" : "local only"}</small>
+                      <button className="link-button" onClick={() => props.setSelectedAgentRun(run)}>Output JSON</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {props.selectedAgentRun ? (
+            <div className="detail-block">
+              <div className="chip-row">
+                <span className={statusClass(props.selectedAgentRun.status)}>{props.selectedAgentRun.status}</span>
+                <span className="status-chip">{props.selectedAgentRun.agent.name}</span>
+              </div>
+              <pre>{JSON.stringify(props.selectedAgentRun.output, null, 2)}</pre>
+            </div>
+          ) : null}
+          {props.agentMessages.length ? (
+            <div className="list-stack">
+              <h3>Messages</h3>
+              {props.agentMessages.map((message) => (
+                <div key={message.id} className="record-block">
+                  <strong>{message.fromAgent.replaceAll("_", " ")} to {message.toAgent.replaceAll("_", " ")}</strong>
+                  <small>{message.response} / {formatDate(message.createdAt)}</small>
+                  <small>claims {message.claimIds.join(", ") || "none"}</small>
+                  <small>citations {message.citations.join(", ") || "none"}</small>
+                  <p>{message.reasoning}</p>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </Panel>
+      ) : null}
+
+      {props.section === "remediations" ? (
+        <>
+          <SecondaryPanel title="Host Findings">
+            <div className="panel-actions">
+              {props.selectedHost ? (
+                <button className="secondary-button" onClick={() => void props.runScan(props.selectedHost?.id ?? "")}>
+                  {props.busy === `scan-${props.selectedHost.id}` ? "Scanning..." : "Run Scan"}
+                </button>
+              ) : null}
+            </div>
+            {props.findings.length === 0 ? <p>No findings for the selected host.</p> : null}
+            <div className="list-stack">
+              {props.findings.map((finding) => (
+                <div key={finding.id} className="record-block">
+                  <div className="chip-row">
+                    <span className={`severity severity-${finding.severity}`}>{finding.severity}</span>
+                    <span className="status-chip">{finding.sourceAgent.replaceAll("_", " ")}</span>
+                    <span className="status-chip">{finding.verifierStatus}</span>
+                  </div>
+                  <h3>{finding.summary}</h3>
+                  <p>{finding.explanation}</p>
+                  {finding.evidence.map((item) => (
+                    <blockquote key={item.citation}>
+                      {item.excerpt}
+                      <footer>{item.source}</footer>
+                    </blockquote>
+                  ))}
+                </div>
+              ))}
+            </div>
+          </SecondaryPanel>
+
+          <Panel title="Remediation Execution">
+            {props.remediations.length === 0 ? <p>No remediations queued.</p> : null}
+            {props.remediations.length > 0 ? (
+              <div className="remediation-workspace">
+                <div className="remediation-list">
+                  {props.remediations.map((remediation) => (
+                    <button
+                      key={remediation.id}
+                      className={`remediation-picker ${props.selectedRemediation?.id === remediation.id ? "selected" : ""}`}
+                      onClick={() => props.setSelectedRemediationId(remediation.id)}
+                    >
+                      <span>
+                        <strong>{remediation.title}</strong>
+                        <small>{hostLabel(props.hosts, remediation.hostId)} / plan v{remediation.planVersion}</small>
+                      </span>
+                      <span className={statusClass(remediation.executionState)}>{remediation.executionState}</span>
+                    </button>
+                  ))}
+                </div>
+
+                {props.selectedRemediation ? (
+                  <div className="execution-flow">
+                    <div className="chip-row">
+                      <span className={`severity severity-${props.selectedRemediation.riskLevel}`}>{props.selectedRemediation.riskLevel}</span>
+                      <span className={statusClass(props.selectedRemediation.approvalState)}>patch {props.selectedRemediation.approvalState}</span>
+                      <span className={statusClass(props.selectedRemediation.rebootApprovalState)}>reboot {props.selectedRemediation.rebootApprovalState}</span>
+                      <span className={statusClass(props.selectedRemediation.executionState)}>{props.selectedRemediation.executionState}</span>
+                    </div>
+                    <h3>{props.selectedRemediation.title}</h3>
+                    <p>{props.selectedRemediation.aiDecision.explanation}</p>
+                    <div className="execution-steps" aria-label="Remediation execution steps">
+                      <div className="execution-step complete">
+                        <strong>1. Review plan</strong>
+                        <small>Plan v{props.selectedRemediation.planVersion} / {props.selectedRemediation.planHash}</small>
+                      </div>
+                      <div className={props.selectedRemediation.approvalState === "approved" ? "execution-step complete" : "execution-step pending"}>
+                        <strong>2. Approve patch</strong>
+                        <small>{props.selectedRemediation.approvalState}</small>
+                      </div>
+                      <div className={!remediationRequiresReboot(props.selectedRemediation) || props.selectedRemediation.rebootApprovalState === "approved" ? "execution-step complete" : "execution-step pending"}>
+                        <strong>3. Approve reboot risk</strong>
+                        <small>{remediationRequiresReboot(props.selectedRemediation) ? props.selectedRemediation.rebootApprovalState : "not required"}</small>
+                      </div>
+                      <div className={["queued", "running", "succeeded"].includes(props.selectedRemediation.executionState) ? "execution-step complete" : "execution-step pending"}>
+                        <strong>4. Queue execution</strong>
+                        <small>{props.selectedRemediation.executionState}</small>
+                      </div>
+                    </div>
+                    <div className="detail-grid">
+                      <div><dt>Host</dt><dd>{hostLabel(props.hosts, props.selectedRemediation.hostId)}</dd></div>
+                      <div><dt>Update scope</dt><dd>{props.selectedRemediation.updateScope}</dd></div>
+                      <div><dt>Reboot assessment</dt><dd>{props.selectedRemediation.rebootAssessment.status.replaceAll("_", " ")}</dd></div>
+                      <div><dt>Downtime</dt><dd>{props.selectedRemediation.rebootAssessment.estimatedDowntimeMinutes} min</dd></div>
+                      <div><dt>Execution timing</dt><dd>{props.selectedRemediation.executionTiming.replaceAll("_", " ")}</dd></div>
+                      <div><dt>Failure policy</dt><dd>{props.selectedRemediation.failurePolicy.notifyOperator ? "notify operator" : "no notification"}</dd></div>
+                    </div>
+                    <p className="muted-text">{props.selectedRemediation.rebootAssessment.rationale}</p>
+                    {props.selectedRemediationBlockers.length > 0 ? (
+                      <div className="execution-blockers">
+                        <strong>Before execution</strong>
+                        {props.selectedRemediationBlockers.map((blocker) => <small key={blocker}>{blocker}</small>)}
+                      </div>
+                    ) : (
+                      <div className="ready-note">This plan is ready to queue. Type the hostname to enable execution.</div>
+                    )}
+                    <div className="action-row">
+                      <button className="primary-button" disabled={props.selectedRemediation.approvalState !== "pending"} onClick={() => void props.approveRemediation(props.selectedRemediation as Remediation)}>Approve Patch</button>
+                      <button className="secondary-button" disabled={props.selectedRemediation.rebootApprovalState !== "pending"} onClick={() => void props.approveRemediationReboot(props.selectedRemediation as Remediation)}>Approve Reboot</button>
+                      <button className="secondary-button" disabled={props.selectedRemediation.approvalState !== "pending"} onClick={() => void props.rejectRemediation(props.selectedRemediation?.id ?? "")}>Reject</button>
+                      <button className="secondary-button" onClick={() => void props.applyLogFilters({ remediationId: props.selectedRemediation?.id ?? "" })}>Related Logs</button>
+                    </div>
+                    <div className="execution-confirm">
+                      <label>
+                        Queue execution confirmation
+                        <input
+                          placeholder={props.selectedRemediationHost ? `type ${props.selectedRemediationHost.name}` : "host unavailable"}
+                          value={props.executionConfirmation}
+                          onChange={(event) => props.setExecutionConfirmation(event.target.value)}
+                        />
+                      </label>
+                      <button
+                        className="primary-button"
+                        disabled={
+                          !canQueueRemediationExecution(props.selectedRemediation, props.selectedRemediationHost)
+                          || !props.selectedRemediationHost
+                          || props.executionConfirmation !== props.selectedRemediationHost.name
+                          || props.busy === `execute-${props.selectedRemediation.id}`
+                        }
+                        onClick={() => void props.queueRemediationExecution(props.selectedRemediation as Remediation)}
+                      >
+                        Queue Execution
+                      </button>
+                    </div>
+                    <div className="model-list">
+                      {props.selectedRemediation.aiDecision.agentAssignments.map((agent) => (
+                        <span key={agent.name}>{agent.name.replaceAll("_", " ")}: {agent.provider}/{agent.model} ({agent.modelTier})</span>
+                      ))}
+                    </div>
+                    {props.selectedRemediation.result ? <pre>{JSON.stringify(props.selectedRemediation.result, null, 2)}</pre> : null}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+          </Panel>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function HealthCell(props: { label: string; healthy: boolean; detail: string }) {
+  return (
+    <div>
+      <dt>{props.label}</dt>
+      <dd>
+        <span className={statusClass(props.healthy ? "ready" : "failed")}>
+          {props.healthy ? "healthy" : "unhealthy"}
+        </span>
+      </dd>
+      <small>{props.detail}</small>
+    </div>
+  );
+}
+
+function OutputBlock(props: { title: string; value: unknown }) {
+  return (
+    <div className="output-block">
+      <dt>{props.title}</dt>
+      <pre>{textValue(props.value)}</pre>
+    </div>
   );
 }
 
@@ -1291,5 +2130,16 @@ function Panel(props: { title: string; children: ReactNode }) {
         {props.children}
       </div>
     </article>
+  );
+}
+
+function SecondaryPanel(props: { title: string; children: ReactNode }) {
+  return (
+    <details className="secondary-panel">
+      <summary>{props.title}</summary>
+      <div className="panel-body">
+        {props.children}
+      </div>
+    </details>
   );
 }

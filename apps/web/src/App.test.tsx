@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { CampaignHostPlan, PatchCampaign } from "@ai-sysadm/shared";
+import type { CampaignHostPlan, Host, PatchCampaign, Remediation } from "@ai-sysadm/shared";
 
 type FetchCall = [RequestInfo | URL, RequestInit | undefined];
 
@@ -193,6 +193,33 @@ describe("operator dashboard API workflows", () => {
 
     await api.executeRemediation("rem-1");
     expect(lastRequest(fetchMock)[0]).toBe("http://localhost:4000/remediations/rem-1/execute");
+
+    const { canQueueRemediationExecution, remediationExecutionBlockers } = await import("./App.js");
+    const host = {
+      patchPolicy: { rebootPolicy: "if_required" }
+    } as Host;
+    const remediation = {
+      approvalState: "approved",
+      approvedBy: "admin",
+      approvedAt: "2026-01-01T00:00:00Z",
+      approvedPlanVersion: 3,
+      approvedPlanHash: "hash-3",
+      planVersion: 3,
+      planHash: "hash-3",
+      rebootAssessment: { status: "required", approvedIfRequired: true },
+      rebootApprovalState: "approved",
+      rebootApprovedBy: "admin",
+      rebootApprovedAt: "2026-01-01T00:00:00Z",
+      rebootApprovedPlanVersion: 3,
+      rebootApprovedPlanHash: "hash-3",
+      executionState: "not_started"
+    } as unknown as Remediation;
+
+    expect(canQueueRemediationExecution(remediation, host)).toBe(true);
+    expect(remediationExecutionBlockers({
+      ...remediation,
+      rebootApprovalState: "pending"
+    }, host)).toContain("Separate reboot approval is required.");
   });
 
   it("handles campaign proposal, per-host approvals, execution, cancel, and plan_changed gating", async () => {

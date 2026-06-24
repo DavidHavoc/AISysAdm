@@ -22,6 +22,40 @@ import type {
 const baseUrl = import.meta.env.VITE_API_URL ?? "http://localhost:4000";
 let csrfToken = sessionStorage.getItem("ai-sysadm-csrf") ?? "";
 
+export type LiveHealth = {
+  ok: boolean;
+};
+
+export type ReadyHealth = {
+  ok: boolean;
+  checks: {
+    database: boolean;
+    redis: boolean;
+    executionMode: string;
+    collectorMode: string;
+  };
+};
+
+export type OpsHealth = {
+  ok: boolean;
+  checks: {
+    worker: {
+      healthy: boolean;
+      lastSeenAt: string | null;
+    };
+    celeryBeat: {
+      healthy: boolean;
+      lastSeenAt: string | null;
+    };
+  };
+};
+
+export type OperationsHealth = {
+  live: LiveHealth;
+  ready: ReadyHealth;
+  ops: OpsHealth;
+};
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (!(init?.body instanceof FormData)) {
@@ -60,7 +94,47 @@ function query(values: Record<string, string | number | undefined>) {
   return rendered ? `?${rendered}` : "";
 }
 
+async function healthRequest<T>(path: string, fallback: T): Promise<T> {
+  try {
+    const response = await fetch(`${baseUrl}${path}`, { credentials: "include" });
+    const payload = await response.json() as unknown;
+    if (
+      payload
+      && typeof payload === "object"
+      && "detail" in payload
+      && (payload as { detail?: unknown }).detail
+    ) {
+      return (payload as { detail: T }).detail;
+    }
+    return payload as T;
+  } catch {
+    return fallback;
+  }
+}
+
 export const api = {
+  getOperationsHealth: async (): Promise<OperationsHealth> => {
+    const [live, ready, ops] = await Promise.all([
+      healthRequest<LiveHealth>("/health/live", { ok: false }),
+      healthRequest<ReadyHealth>("/health/ready", {
+        ok: false,
+        checks: {
+          database: false,
+          redis: false,
+          executionMode: "unknown",
+          collectorMode: "unknown"
+        }
+      }),
+      healthRequest<OpsHealth>("/health/ops", {
+        ok: false,
+        checks: {
+          worker: { healthy: false, lastSeenAt: null },
+          celeryBeat: { healthy: false, lastSeenAt: null }
+        }
+      })
+    ]);
+    return { live, ready, ops };
+  },
   login: async (username: string, password: string) => {
     const response = await request<{ user: User; csrfToken: string }>("/auth/login", {
       method: "POST",
