@@ -1,0 +1,25 @@
+#!/usr/bin/env sh
+set -eu
+
+args=" $* "
+
+case "$args" in
+  *" -k "*)
+    printf '%s\n' \
+      'Jun 24 00:00:01 kernel: audit: integration kernel warning sample' \
+      'Jun 24 00:00:02 kernel: apparmor: integration profile notice'
+    ;;
+  *" -u ssh "*|*" -u sshd "*|*" -t sudo "*)
+    printf '%s\n' \
+      'Jun 24 00:00:03 sshd[101]: Accepted publickey for sysadm from 172.18.0.1 port 55555 ssh2' \
+      'Jun 24 00:00:04 sudo: sysadm : TTY=pts/0 ; PWD=/home/sysadm ; USER=root ; COMMAND=/usr/bin/true'
+    ;;
+  *"*.service"*|*" .service "*)
+    printf '%s\n' \
+      'Jun 24 00:00:05 ssh.service: Started OpenSSH server fixture'
+    ;;
+  *)
+    printf '%s\n' \
+      'Jun 24 00:00:06 apt.systemd.daily[200]: integration package metadata warning sample'
+    ;;
+esac

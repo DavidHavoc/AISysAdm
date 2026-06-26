@@ -16,6 +16,7 @@
     "test:js": "npm run test --workspaces",
     "test:api": "PYTHONPATH=apps/api ./.venv/bin/python -m pytest apps/api/tests -m \"not integration\"",
     "test:integration": "./scripts/integration.sh test",
+    "test:integration:real-host": "./scripts/integration.sh real-host",
     "test:integration:cleanup": "./scripts/integration.sh cleanup"
   }
 }

@@ -1,0 +1,9 @@
+---
+- name: Simulated snapshot rollback
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Record simulated snapshot rollback
+      ansible.builtin.debug:
+        msg: "rolled back {{ external_snapshot_id | default('snapshot') }}"
+      changed_when: false

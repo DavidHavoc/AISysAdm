@@ -23,15 +23,19 @@ class InlineJobDispatcher(JobDispatcher):
             await self.service.process_scan(job.id)
         elif job.job_type == "remediation":
             await self.service.process_remediation(job.id)
+        elif job.job_type == "snapshot_delete":
+            await self.service.process_snapshot_delete(job.id)
 
 
 class CeleryJobDispatcher(JobDispatcher):
     async def dispatch(self, job: DurableJob) -> None:
         if job.status != "queued":
             return
-        from .tasks import run_remediation, run_scan
+        from .tasks import run_remediation, run_scan, run_snapshot_delete
 
         if job.job_type == "scan":
             run_scan.delay(job.id)
         elif job.job_type == "remediation":
             run_remediation.delay(job.id)
+        elif job.job_type == "snapshot_delete":
+            run_snapshot_delete.delay(job.id)

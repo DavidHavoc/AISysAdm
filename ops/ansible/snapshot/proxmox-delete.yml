@@ -1,0 +1,18 @@
+---
+- name: Proxmox snapshot delete stub
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Validate runtime snapshot variables
+      ansible.builtin.assert:
+        that:
+          - external_snapshot_id is defined
+          - external_snapshot_id | length > 0
+          - snapshot_secret_file is defined
+          - snapshot_secret_file | length > 0
+        fail_msg: "Proxmox snapshot ID and runtime credential file are required"
+
+    - name: Record cataloged Proxmox delete request
+      ansible.builtin.debug:
+        msg: "delete requested for {{ external_snapshot_id }}"
+      changed_when: false

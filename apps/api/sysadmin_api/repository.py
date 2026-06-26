@@ -22,6 +22,7 @@ from .database import (
     JobRecord,
     LogEventRecord,
     RemediationRecord,
+    RollbackSnapshotRecord,
     ScanRecord,
     ScheduleRecord,
     SessionRecord,
@@ -43,6 +44,7 @@ from .models import (
     JobFailure,
     PatchCampaign,
     Remediation,
+    RollbackSnapshot,
     ScanJob,
     SshCredential,
     StructuredLogEvent,
@@ -128,6 +130,25 @@ class Repository:
     def get_host(self, host_id: str) -> Optional[Host]:
         raise NotImplementedError
 
+    def save_rollback_snapshot(
+        self,
+        snapshot: RollbackSnapshot,
+    ) -> RollbackSnapshot:
+        raise NotImplementedError
+
+    def get_rollback_snapshot(
+        self,
+        snapshot_id: str,
+    ) -> Optional[RollbackSnapshot]:
+        raise NotImplementedError
+
+    def list_rollback_snapshots(
+        self,
+        host_id: Optional[str] = None,
+        remediation_id: Optional[str] = None,
+    ) -> List[RollbackSnapshot]:
+        raise NotImplementedError
+
     def healthcheck(self) -> bool:
         raise NotImplementedError
 
@@ -180,6 +201,7 @@ class InMemoryRepository(Repository):
         self.credentials: Dict[str, Tuple[SshCredential, bytes, bytes]] = {}
         self.schedules: Dict[str, HostSchedule] = {}
         self.snapshots: Dict[str, HostSnapshot] = {}
+        self.rollback_snapshots: Dict[str, RollbackSnapshot] = {}
         self.scans: Dict[str, ScanJob] = {}
         self.agent_runs: Dict[str, AgentRun] = {}
         self.agent_messages: Dict[str, AgentMessage] = {}
@@ -262,6 +284,34 @@ class InMemoryRepository(Repository):
 
     def get_snapshot(self, snapshot_id: str) -> Optional[HostSnapshot]:
         return self.snapshots.get(snapshot_id)
+
+    def save_rollback_snapshot(
+        self,
+        snapshot: RollbackSnapshot,
+    ) -> RollbackSnapshot:
+        self.rollback_snapshots[snapshot.id] = snapshot.model_copy(deep=True)
+        return snapshot
+
+    def get_rollback_snapshot(
+        self,
+        snapshot_id: str,
+    ) -> Optional[RollbackSnapshot]:
+        snapshot = self.rollback_snapshots.get(snapshot_id)
+        return snapshot.model_copy(deep=True) if snapshot else None
+
+    def list_rollback_snapshots(
+        self,
+        host_id: Optional[str] = None,
+        remediation_id: Optional[str] = None,
+    ) -> List[RollbackSnapshot]:
+        items = [item.model_copy(deep=True) for item in self.rollback_snapshots.values()]
+        if host_id:
+            items = [item for item in items if item.host_id == host_id]
+        if remediation_id:
+            items = [
+                item for item in items if item.remediation_id == remediation_id
+            ]
+        return items
 
     def save_scan(self, scan: ScanJob) -> ScanJob:
         self.scans[scan.id] = scan
@@ -682,7 +732,13 @@ class SqlRepository(Repository):
             record = session.get(CredentialRecord, credential.id)
             values = {
                 "name": credential.name,
+                "credential_type": (
+                    credential.credential_type.value
+                    if hasattr(credential.credential_type, "value")
+                    else str(credential.credential_type)
+                ),
                 "fingerprint": credential.fingerprint,
+                "credential_metadata": credential.metadata,
                 "encrypted_key": encrypted_key,
                 "nonce": nonce,
                 "created_at": credential.created_at,
@@ -702,7 +758,13 @@ class SqlRepository(Repository):
             SshCredential(
                 id=row.id,
                 name=row.name,
+                credential_type=getattr(
+                    row,
+                    "credential_type",
+                    "ssh_private_key",
+                ),
                 fingerprint=row.fingerprint,
+                metadata=getattr(row, "credential_metadata", {}) or {},
                 created_at=row.created_at,
                 last_used_at=row.last_used_at,
             )
@@ -721,7 +783,13 @@ class SqlRepository(Repository):
                 SshCredential(
                     id=row.id,
                     name=row.name,
+                    credential_type=getattr(
+                        row,
+                        "credential_type",
+                        "ssh_private_key",
+                    ),
                     fingerprint=row.fingerprint,
+                    metadata=getattr(row, "credential_metadata", {}) or {},
                     created_at=row.created_at,
                     last_used_at=row.last_used_at,
                 ),
@@ -787,6 +855,59 @@ class SqlRepository(Repository):
 
     def get_snapshot(self, snapshot_id: str) -> Optional[HostSnapshot]:
         return self._get_payload(SnapshotRecord, HostSnapshot, snapshot_id)
+
+    def save_rollback_snapshot(
+        self,
+        snapshot: RollbackSnapshot,
+    ) -> RollbackSnapshot:
+        return self._upsert_payload(
+            RollbackSnapshotRecord,
+            snapshot,
+            {
+                "host_id": snapshot.host_id,
+                "remediation_id": snapshot.remediation_id,
+                "provider": (
+                    snapshot.provider.value
+                    if hasattr(snapshot.provider, "value")
+                    else str(snapshot.provider)
+                ),
+                "state": (
+                    snapshot.state.value
+                    if hasattr(snapshot.state, "value")
+                    else str(snapshot.state)
+                ),
+                "external_snapshot_id": snapshot.external_snapshot_id,
+                "delete_after": snapshot.delete_after,
+                "created_at": snapshot.created_at,
+                "updated_at": snapshot.updated_at,
+            },
+        )
+
+    def get_rollback_snapshot(
+        self,
+        snapshot_id: str,
+    ) -> Optional[RollbackSnapshot]:
+        return self._get_payload(
+            RollbackSnapshotRecord,
+            RollbackSnapshot,
+            snapshot_id,
+        )
+
+    def list_rollback_snapshots(
+        self,
+        host_id: Optional[str] = None,
+        remediation_id: Optional[str] = None,
+    ) -> List[RollbackSnapshot]:
+        statement = select(RollbackSnapshotRecord)
+        if host_id:
+            statement = statement.where(RollbackSnapshotRecord.host_id == host_id)
+        if remediation_id:
+            statement = statement.where(
+                RollbackSnapshotRecord.remediation_id == remediation_id
+            )
+        with self._session_scope() as session:
+            rows = session.scalars(statement).all()
+        return [RollbackSnapshot.model_validate(row.payload) for row in rows]
 
     def save_scan(self, scan: ScanJob) -> ScanJob:
         return self._upsert_payload(

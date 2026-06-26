@@ -244,6 +244,19 @@ Run the suite and always clean up afterward:
 ./scripts/integration.sh verify
 ```
 
+Run the opt-in real-host suite against disposable Docker SSH targets:
+
+```bash
+./scripts/integration.sh real-host
+```
+
+This suite requires local SSH tools and `ansible-playbook`. It generates a
+test-only SSH key under `.data/integration/real-host`, starts a disposable
+Ubuntu SSH target on `127.0.0.1:52222`, and uses `COLLECTOR_MODE=ssh` plus
+`EXECUTION_MODE=ansible`. Do not point these tests at production hosts or at
+personal SSH keys. Details, troubleshooting, and VM guidance are in
+[`docs/real-host-integration.md`](docs/real-host-integration.md).
+
 Remove containers, networks, and volumes:
 
 ```bash
@@ -258,6 +271,7 @@ The integration suite covers:
 - Healthy readiness plus Redis and PostgreSQL failure reporting
 - Ninety-day structured log retention
 - Celery task publication and execution through Redis
+- Opt-in SSH and Ansible workflows against disposable real hosts
 
 SQLite remains useful for fast repository tests, but it does not reproduce
 PostgreSQL row locking, native JSON and timestamp behavior, or Alembic upgrade
@@ -301,7 +315,9 @@ saved SSH keys will no longer decrypt.
 - Snapshot and rollback provider integrations are deferred.
 - The dashboard does not yet expose every API workflow.
 - Authentication currently targets a single private-alpha administrator.
-- SSH, Ansible, and Ubuntu VM integration coverage is still incomplete.
+- Docker-backed SSH and Ansible integration coverage exists for disposable
+  targets. Full VM, systemd reboot, package mirror, and rollback coverage is
+  still incomplete.
 - Deployment packaging, backup and restore automation, and production
   hardening are not complete.
 

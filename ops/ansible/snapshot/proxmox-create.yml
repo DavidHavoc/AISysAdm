@@ -1,0 +1,18 @@
+---
+- name: Proxmox snapshot create stub
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Validate runtime snapshot variables
+      ansible.builtin.assert:
+        that:
+          - snapshot_target_id is defined
+          - snapshot_target_id | length > 0
+          - snapshot_secret_file is defined
+          - snapshot_secret_file | length > 0
+        fail_msg: "Proxmox snapshot target and runtime credential file are required"
+
+    - name: Record cataloged Proxmox snapshot request
+      ansible.builtin.debug:
+        msg: "external_snapshot_id=proxmox-{{ snapshot_target_id }}"
+      changed_when: false

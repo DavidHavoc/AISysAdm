@@ -17,9 +17,10 @@ from .credentials import CredentialService
 from .executor import AnsibleExecutor, SimulatedExecutor
 from .memory import InMemoryAgentMemory, RedisAgentMemory
 from .providers import ModelRouter
-from .repository import InMemoryRepository, Repository, SqlRepository
+from .repository import Repository, SqlRepository
 from .security import AuthService, LoginRateLimiter
 from .service import SysadminService
+from .snapshots import AnsibleSnapshotProvider, SimulatedSnapshotProvider
 
 
 @dataclass
@@ -73,6 +74,15 @@ def build_runtime(
         if resolved.execution_mode == "ansible"
         else SimulatedExecutor()
     )
+    snapshot_provider = (
+        AnsibleSnapshotProvider(
+            resolve_path(resolved.ansible_snapshot_playbook_dir),
+            resolve_path(resolved.ansible_callback_dir),
+            credentials,
+        )
+        if resolved.execution_mode == "ansible"
+        else SimulatedSnapshotProvider()
+    )
     auth = AuthService(
         repo,
         resolved.session_ttl_hours,
@@ -89,6 +99,7 @@ def build_runtime(
         collector=collector,
         workflow=workflow,
         executor=executor,
+        snapshot_provider=snapshot_provider,
         log_retention_days=resolved.log_retention_days,
         job_lease_seconds=resolved.job_lease_seconds,
         job_heartbeat_seconds=resolved.job_heartbeat_seconds,

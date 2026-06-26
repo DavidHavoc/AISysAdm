@@ -1,0 +1,13 @@
+---
+- name: Test full upgrade no-op package path
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: "[patch.packages.refresh] Refresh apt metadata fixture"
+      ansible.builtin.command: apt-get --version
+      changed_when: false
+
+    - name: "[patch.packages.full_upgrade] Exercise cataloged full no-op"
+      ansible.builtin.command: "true"
+      changed_when: false

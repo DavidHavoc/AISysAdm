@@ -1,17 +1,15 @@
 from __future__ import annotations
 
+import json
 from typing import Optional
 
 from fastapi import (
     Depends,
     FastAPI,
-    File,
-    Form,
     HTTPException,
     Query,
     Request,
     Response,
-    UploadFile,
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +24,8 @@ from .models import (
     CampaignRequest,
     ConnectionTestRequest,
     ConnectionTestResult,
+    CredentialCreateRequest,
+    CredentialType,
     DurableJob,
     Host,
     HostInput,
@@ -36,6 +36,7 @@ from .models import (
     LogPage,
     PatchCampaign,
     Remediation,
+    RollbackSnapshot,
     ScanJob,
     ScanRequest,
     SshCredential,
@@ -48,6 +49,51 @@ from .runtime import Runtime, build_runtime
 
 SESSION_COOKIE = "ai_sysadm_session"
 CSRF_HEADER = "x-csrf-token"
+
+
+async def parse_credential_create_request(request: Request, credential_service):
+    content_type = request.headers.get("content-type", "")
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        name = str(form.get("name") or "").strip()
+        if not name:
+            raise ValueError("Credential name is required")
+        credential_type = CredentialType(
+            str(
+                form.get("credentialType")
+                or form.get("credential_type")
+                or "ssh_private_key"
+            )
+        )
+        metadata_raw = str(
+            form.get("metadata")
+            or form.get("metadataJson")
+            or "{}"
+        )
+        metadata = json.loads(metadata_raw)
+        if not isinstance(metadata, dict):
+            raise ValueError("Credential metadata must be an object")
+        if credential_type == CredentialType.SSH_PRIVATE_KEY:
+            key = form.get("key")
+            if not hasattr(key, "read"):
+                raise ValueError("SSH private key file is required")
+            return credential_service.save_private_key(name, await key.read())
+        secret = str(form.get("secret") or "").encode("utf-8")
+        return credential_service.save_secret(
+            name,
+            credential_type,
+            secret,
+            metadata,
+        )
+
+    payload = CredentialCreateRequest.model_validate(await request.json())
+    secret = (payload.secret or "").encode("utf-8")
+    return credential_service.save_secret(
+        payload.name,
+        payload.credential_type,
+        secret,
+        payload.metadata,
+    )
 
 
 def create_app(
@@ -243,26 +289,28 @@ def create_app(
         return resolved_runtime.credentials.list_credentials()
 
     @app.post("/credentials", response_model=SshCredential, status_code=201)
-    async def upload_key(
-        name: str = Form(...),
-        key: UploadFile = File(...),
+    async def create_credential(
+        request: Request,
         user: User = Depends(
             authorize(ProtectedAction.MANAGE_CREDENTIALS, require_csrf=True)
         ),
     ):
         try:
-            credential = resolved_runtime.credentials.save_private_key(
-                name,
-                await key.read(),
+            credential = await parse_credential_create_request(
+                request,
+                resolved_runtime.credentials,
             )
-        except ValueError as error:
+        except (ValueError, json.JSONDecodeError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         resolved_runtime.service.audit(
             user.username,
             "credential.created",
             "credential",
             credential.id,
-            {"fingerprint": credential.fingerprint},
+            {
+                "fingerprint": credential.fingerprint,
+                "credential_type": credential.credential_type,
+            },
         )
         return credential
 
@@ -398,6 +446,17 @@ def create_app(
         user: User = Depends(authorize(ProtectedAction.VIEW_REMEDIATIONS))
     ):
         return resolved_runtime.service.list_remediations()
+
+    @app.get("/snapshots", response_model=list[RollbackSnapshot])
+    async def list_snapshots(
+        host_id: Optional[str] = Query(default=None, alias="hostId"),
+        remediation_id: Optional[str] = Query(default=None, alias="remediationId"),
+        user: User = Depends(authorize(ProtectedAction.VIEW_REMEDIATIONS)),
+    ):
+        return resolved_runtime.service.list_rollback_snapshots(
+            host_id=host_id,
+            remediation_id=remediation_id,
+        )
 
     @app.post(
         "/remediations/{remediation_id}/approve",

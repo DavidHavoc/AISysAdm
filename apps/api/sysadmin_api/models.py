@@ -83,6 +83,34 @@ class CampaignHostState(str, Enum):
     PLAN_CHANGED = "plan_changed"
 
 
+class CredentialType(str, Enum):
+    SSH_PRIVATE_KEY = "ssh_private_key"
+    PROXMOX_TOKEN = "proxmox_token"
+    AWS_ACCESS_KEY = "aws_access_key"
+    AWS_ROLE = "aws_role"
+    VMWARE_SECRET = "vmware_secret"
+    LIBVIRT_SSH = "libvirt_ssh"
+
+
+class SnapshotPlatform(str, Enum):
+    NONE = "none"
+    PROXMOX = "proxmox"
+    AWS = "aws"
+    VMWARE = "vmware"
+    LIBVIRT = "libvirt"
+
+
+class RollbackSnapshotState(str, Enum):
+    CREATING = "creating"
+    CREATED = "created"
+    DELETE_SCHEDULED = "delete_scheduled"
+    DELETED = "deleted"
+    ROLLBACK_STARTED = "rollback_started"
+    ROLLED_BACK = "rolled_back"
+    ROLLBACK_FAILED = "rollback_failed"
+    DELETE_FAILED = "delete_failed"
+
+
 class AgentIdentity(ApiModel):
     name: AgentName
     responsibility: str
@@ -162,6 +190,13 @@ class HostInput(ApiModel):
     )
     credential_id: Optional[str] = None
     ssh_host_key_fingerprint: Optional[str] = None
+    snapshot_platform: SnapshotPlatform = SnapshotPlatform.NONE
+    snapshot_credential_id: Optional[str] = None
+    snapshot_target_id: Optional[str] = None
+    snapshot_provider_metadata: Dict[str, Any] = Field(default_factory=dict)
+    critical_service_name: Optional[str] = None
+    health_check_url: Optional[str] = None
+    snapshot_retention_days: int = Field(default=7, ge=1, le=365)
     patch_policy: PatchPolicy = Field(default_factory=PatchPolicy)
 
 
@@ -191,9 +226,18 @@ class HostSchedule(HostScheduleInput):
 class SshCredential(ApiModel):
     id: str
     name: str
+    credential_type: CredentialType = CredentialType.SSH_PRIVATE_KEY
     fingerprint: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     last_used_at: Optional[datetime] = None
+
+
+class CredentialCreateRequest(ApiModel):
+    name: str
+    credential_type: CredentialType = CredentialType.SSH_PRIVATE_KEY
+    secret: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ConnectionTestResult(ApiModel):
@@ -415,6 +459,34 @@ class ExecutionResult(ApiModel):
     failure_actions_taken: List[str] = Field(default_factory=list)
 
 
+class SnapshotOperationResult(ApiModel):
+    success: bool
+    external_snapshot_id: Optional[str] = None
+    summary: str
+    events: List[StructuredLogEvent] = Field(default_factory=list)
+
+
+class SnapshotHealthResult(ApiModel):
+    healthy: bool
+    summary: str
+    checks: Dict[str, str] = Field(default_factory=dict)
+    events: List[StructuredLogEvent] = Field(default_factory=list)
+
+
+class RollbackSnapshot(ApiModel):
+    id: str
+    host_id: str
+    remediation_id: str
+    provider: SnapshotPlatform
+    external_snapshot_id: Optional[str] = None
+    state: RollbackSnapshotState = RollbackSnapshotState.CREATING
+    delete_after: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+    failure_summary: Optional[str] = None
+    health_check_result: Dict[str, str] = Field(default_factory=dict)
+
+
 class Remediation(ApiModel):
     id: str
     host_id: str
@@ -606,10 +678,6 @@ class ApprovalRequest(ApiModel):
     plan_version: int
     plan_hash: str
     hostname_confirmation: str
-
-
-class RebootApprovalRequest(ApprovalRequest):
-    pass
 
 
 class LogPage(ApiModel):

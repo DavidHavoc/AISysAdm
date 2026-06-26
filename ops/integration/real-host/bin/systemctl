@@ -1,0 +1,19 @@
+#!/usr/bin/env sh
+set -eu
+
+args=" $* "
+
+case "$args" in
+  *" is-system-running "*)
+    printf '%s\n' 'running'
+    ;;
+  *" --failed "*|*" list-units "*)
+    exit 0
+    ;;
+  *)
+    if [ -x /bin/systemctl ]; then
+      exec /bin/systemctl "$@"
+    fi
+    exit 0
+    ;;
+esac

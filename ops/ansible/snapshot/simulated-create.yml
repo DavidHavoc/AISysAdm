@@ -1,0 +1,9 @@
+---
+- name: Simulated snapshot create
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Record simulated snapshot ID
+      ansible.builtin.debug:
+        msg: "external_snapshot_id=simulated-{{ snapshot_target_id | default('target') }}"
+      changed_when: false

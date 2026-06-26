@@ -724,6 +724,13 @@ class OrchestratorAgent:
             created_at=utc_now(),
             updated_at=utc_now(),
         )
+        if host.snapshot_platform != "none":
+            remediation.pre_change_protection = {
+                "supported": True,
+                "status": "configured",
+                "provider": host.snapshot_platform,
+                "retention_days": host.snapshot_retention_days,
+            }
         remediation.plan_hash = remediation_plan_hash(remediation)
         return remediation
 

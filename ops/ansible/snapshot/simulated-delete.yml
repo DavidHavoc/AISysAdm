@@ -1,0 +1,9 @@
+---
+- name: Simulated snapshot delete
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Record simulated snapshot deletion
+      ansible.builtin.debug:
+        msg: "deleted {{ external_snapshot_id | default('snapshot') }}"
+      changed_when: false

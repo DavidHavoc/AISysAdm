@@ -1,0 +1,9 @@
+---
+- name: Test refresh package metadata
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: "[patch.packages.refresh] Refresh apt metadata fixture"
+      ansible.builtin.command: apt-get --version
+      changed_when: false

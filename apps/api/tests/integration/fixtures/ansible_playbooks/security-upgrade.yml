@@ -1,0 +1,23 @@
+---
+- name: Test security upgrade no-op package path
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: "[patch.packages.refresh] Refresh apt metadata fixture"
+      ansible.builtin.command: apt-get --version
+      register: apt_version
+      changed_when: false
+
+    - name: "[patch.packages.security_upgrade] Exercise cataloged security no-op"
+      ansible.builtin.shell:
+        cmd: "printf 'package_path=noop\n'; printf 'token=super-secret-token\n' >&2"
+      register: security_upgrade
+      changed_when: false
+
+    - name: "[patch.packages.report] Report safe package path"
+      ansible.builtin.debug:
+        msg:
+          apt: "{{ apt_version.stdout_lines[0] }}"
+          result: "{{ security_upgrade.stdout }}"
+          authorization: "Bearer super-secret-token"

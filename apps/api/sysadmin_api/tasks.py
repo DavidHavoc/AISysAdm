@@ -42,6 +42,10 @@ celery_app.conf.update(
             "task": "sysadmin.release_maintenance_jobs",
             "schedule": 60.0,
         },
+        "release-snapshot-delete-jobs": {
+            "task": "sysadmin.release_snapshot_delete_jobs",
+            "schedule": 3600.0,
+        },
         "recover-expired-jobs": {
             "task": "sysadmin.recover_expired_jobs",
             "schedule": 30.0,
@@ -125,6 +129,19 @@ def run_remediation(self, job_id: str):
     return sanitize_celery_payload(job.model_dump(mode="json"))
 
 
+@celery_app.task(
+    name="sysadmin.run_snapshot_delete",
+    bind=True,
+)
+def run_snapshot_delete(self, job_id: str):
+    _record_health(WORKER_HEALTH_KEY)
+    job = asyncio.run(
+        get_runtime().service.process_snapshot_delete(job_id, _worker_id(self))
+    )
+    _schedule_retry(run_snapshot_delete, job)
+    return sanitize_celery_payload(job.model_dump(mode="json"))
+
+
 @celery_app.task(name="sysadmin.dispatch_schedules")
 def dispatch_schedules():
     jobs = get_runtime().service.create_due_scan_jobs()
@@ -141,6 +158,14 @@ def release_maintenance_jobs():
     return {"queued": len(jobs)}
 
 
+@celery_app.task(name="sysadmin.release_snapshot_delete_jobs")
+def release_snapshot_delete_jobs():
+    jobs = get_runtime().service.release_scheduled_snapshot_delete_jobs()
+    for job in jobs:
+        run_snapshot_delete.delay(job.id)
+    return {"queued": len(jobs)}
+
+
 @celery_app.task(name="sysadmin.recover_expired_jobs")
 def recover_expired_jobs():
     jobs = get_runtime().service.recover_expired_jobs()
@@ -149,6 +174,8 @@ def recover_expired_jobs():
             run_scan.delay(job.id)
         elif job.job_type == "remediation":
             run_remediation.delay(job.id)
+        elif job.job_type == "snapshot_delete":
+            run_snapshot_delete.delay(job.id)
     return {"queued": len(jobs)}
 
 

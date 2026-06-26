@@ -1,0 +1,9 @@
+---
+- name: Test approved reboot no-op
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: "[reboot.execution.restart] Record approved reboot fixture"
+      ansible.builtin.command: "true"
+      changed_when: true

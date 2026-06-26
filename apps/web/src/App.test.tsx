@@ -147,6 +147,13 @@ describe("operator dashboard API workflows", () => {
       availabilityClass: "standard" as const,
       credentialId: "cred-1",
       sshHostKeyFingerprint: null,
+      snapshotPlatform: "none" as const,
+      snapshotCredentialId: null,
+      snapshotTargetId: null,
+      snapshotProviderMetadata: {},
+      criticalServiceName: null,
+      healthCheckUrl: null,
+      snapshotRetentionDays: 7,
       patchPolicy: {
         updateMode: "orchestrator_decides" as const,
         executionTiming: "immediate" as const,

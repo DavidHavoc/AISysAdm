@@ -11,6 +11,19 @@ export const userSchema = z.object({
 });
 export type User = z.infer<typeof userSchema>;
 
+export const credentialTypeSchema = z.enum([
+  "ssh_private_key",
+  "proxmox_token",
+  "aws_access_key",
+  "aws_role",
+  "vmware_secret",
+  "libvirt_ssh"
+]);
+export type CredentialType = z.infer<typeof credentialTypeSchema>;
+
+export const snapshotPlatformSchema = z.enum(["none", "proxmox", "aws", "vmware", "libvirt"]);
+export type SnapshotPlatform = z.infer<typeof snapshotPlatformSchema>;
+
 export const maintenanceWindowSchema = z.object({
   timezone: z.string(),
   weekdays: z.array(z.number()),
@@ -39,6 +52,13 @@ export const hostInputSchema = z.object({
   availabilityClass: z.enum(["standard", "high_availability"]),
   credentialId: z.string().nullable().optional(),
   sshHostKeyFingerprint: z.string().nullable().optional(),
+  snapshotPlatform: snapshotPlatformSchema.default("none"),
+  snapshotCredentialId: z.string().nullable().optional(),
+  snapshotTargetId: z.string().nullable().optional(),
+  snapshotProviderMetadata: z.record(z.string(), z.unknown()).default({}),
+  criticalServiceName: z.string().nullable().optional(),
+  healthCheckUrl: z.string().nullable().optional(),
+  snapshotRetentionDays: z.number().default(7),
   patchPolicy: patchPolicySchema
 });
 export type HostInput = z.infer<typeof hostInputSchema>;
@@ -54,11 +74,22 @@ export type Host = z.infer<typeof hostSchema>;
 export const credentialSchema = z.object({
   id: z.string(),
   name: z.string(),
+  credentialType: credentialTypeSchema.default("ssh_private_key"),
   fingerprint: z.string(),
+  metadata: z.record(z.string(), z.unknown()).default({}),
   createdAt: z.string(),
   lastUsedAt: z.string().nullable().optional()
 });
 export type SshCredential = z.infer<typeof credentialSchema>;
+export type StoredCredential = SshCredential;
+
+export const credentialCreateSchema = z.object({
+  name: z.string(),
+  credentialType: credentialTypeSchema,
+  secret: z.string().nullable().optional(),
+  metadata: z.record(z.string(), z.unknown()).default({})
+});
+export type CredentialCreate = z.infer<typeof credentialCreateSchema>;
 
 export const scheduleSchema = z.object({
   id: z.string(),
@@ -208,13 +239,38 @@ export const remediationSchema = z.object({
       summary: z.string(),
       output: z.string(),
       changed: z.boolean()
-    }))
+    })),
+    failureActionsTaken: z.array(z.string()).optional()
   }).nullable(),
   preChangeProtection: z.record(z.string(), z.unknown()),
   createdAt: z.string(),
   updatedAt: z.string()
 });
 export type Remediation = z.infer<typeof remediationSchema>;
+
+export const rollbackSnapshotSchema = z.object({
+  id: z.string(),
+  hostId: z.string(),
+  remediationId: z.string(),
+  provider: snapshotPlatformSchema,
+  externalSnapshotId: z.string().nullable(),
+  state: z.enum([
+    "creating",
+    "created",
+    "delete_scheduled",
+    "deleted",
+    "rollback_started",
+    "rolled_back",
+    "rollback_failed",
+    "delete_failed"
+  ]),
+  deleteAfter: z.string().nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  failureSummary: z.string().nullable(),
+  healthCheckResult: z.record(z.string(), z.string()).default({})
+});
+export type RollbackSnapshot = z.infer<typeof rollbackSnapshotSchema>;
 
 export const jobSchema = z.object({
   id: z.string(),

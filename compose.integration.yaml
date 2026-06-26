@@ -37,3 +37,43 @@ services:
       interval: 1s
       timeout: 3s
       retries: 30
+
+  ubuntu-ssh:
+    profiles:
+      - real-host
+    build:
+      context: .
+      dockerfile: ops/integration/real-host/Dockerfile
+      args:
+        BASE_IMAGE: ubuntu:24.04
+    ports:
+      - "127.0.0.1:${REAL_HOST_UBUNTU_PORT:-52222}:22"
+    volumes:
+      - ./.data/integration/real-host/authorized_keys:/home/sysadm/.ssh/authorized_keys:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pgrep -x sshd >/dev/null
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  debian-ssh:
+    profiles:
+      - real-host-debian
+    build:
+      context: .
+      dockerfile: ops/integration/real-host/Dockerfile
+      args:
+        BASE_IMAGE: debian:12
+    ports:
+      - "127.0.0.1:${REAL_HOST_DEBIAN_PORT:-52223}:22"
+    volumes:
+      - ./.data/integration/real-host/authorized_keys:/home/sysadm/.ssh/authorized_keys:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pgrep -x sshd >/dev/null
+      interval: 1s
+      timeout: 3s
+      retries: 30

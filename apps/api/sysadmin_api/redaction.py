@@ -64,6 +64,22 @@ def _placeholder_for_key(key: str) -> Optional[str]:
         return "[API_KEY]"
     if "client_secret" in lowered or lowered == "secret":
         return "[SECRET]"
+    if (
+        "credential_id" in lowered
+        or "credentialid" in lowered
+        or lowered.endswith("_credential")
+    ):
+        return "[CREDENTIAL]"
+    if (
+        "provider_metadata" in lowered
+        or "providermetadata" in lowered
+        or lowered == "metadata"
+    ):
+        return "[PROVIDER_METADATA]"
+    if "snapshot_target" in lowered or "snapshottarget" in lowered:
+        return "[SNAPSHOT_TARGET]"
+    if "external_snapshot" in lowered or "externalsnapshot" in lowered:
+        return "[SNAPSHOT_ID]"
     if lowered == "token" or lowered.endswith("_token"):
         return "[TOKEN]"
     if "email" in lowered:

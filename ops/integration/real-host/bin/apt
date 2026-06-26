@@ -1,0 +1,13 @@
+#!/usr/bin/env sh
+set -eu
+
+if [ "${1:-}" = "list" ] && [ "${2:-}" = "--upgradable" ]; then
+  if [ -f /tmp/ai-sysadm-no-updates ]; then
+    printf '%s\n' 'Listing...'
+    exit 0
+  fi
+  cat /etc/ai-sysadm/upgradable-packages.txt
+  exit 0
+fi
+
+exec /usr/bin/apt "$@"

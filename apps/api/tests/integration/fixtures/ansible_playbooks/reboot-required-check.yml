@@ -1,0 +1,14 @@
+---
+- name: Test reboot required marker
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: "[reboot.decision.marker] Check reboot-required file"
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: "[reboot.decision.report] Print reboot state"
+      ansible.builtin.debug:
+        msg: "reboot_required={{ reboot_required.stat.exists | lower }}"

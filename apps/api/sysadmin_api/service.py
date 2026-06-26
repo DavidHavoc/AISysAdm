@@ -11,6 +11,7 @@ from croniter import croniter
 
 from .agents import MultiAgentWorkflow, remediation_plan_hash
 from .collector import HostCollector
+from .credentials import SNAPSHOT_CREDENTIAL_TYPES
 from .executor import RemediationExecutor
 from .models import (
     AgentMessage,
@@ -23,7 +24,9 @@ from .models import (
     CampaignRequest,
     CampaignStatus,
     ConnectionTestResult,
+    CredentialType,
     DurableJob,
+    ExecutionPhase,
     Host,
     HostInput,
     HostSchedule,
@@ -33,14 +36,18 @@ from .models import (
     MaintenanceWindow,
     PatchCampaign,
     Remediation,
+    RollbackSnapshot,
+    RollbackSnapshotState,
     ScanJob,
     ScanRequest,
     Severity,
+    SnapshotPlatform,
     StructuredLogEvent,
     utc_now,
 )
 from .redaction import redact_text, sanitize_audit_details, sanitize_log_event
-from .repository import Repository
+from .repository import Repository, normalized_datetime
+from .snapshots import SimulatedSnapshotProvider, SnapshotProvider
 
 
 ResultT = TypeVar("ResultT")
@@ -67,6 +74,7 @@ class SysadminService:
         collector: HostCollector,
         workflow: MultiAgentWorkflow,
         executor: RemediationExecutor,
+        snapshot_provider: Optional[SnapshotProvider] = None,
         log_retention_days: int = 90,
         job_lease_seconds: int = 120,
         job_heartbeat_seconds: int = 30,
@@ -75,6 +83,7 @@ class SysadminService:
         self.collector = collector
         self.workflow = workflow
         self.executor = executor
+        self.snapshot_provider = snapshot_provider or SimulatedSnapshotProvider()
         self.log_retention_days = log_retention_days
         self.job_lease_seconds = job_lease_seconds
         self.job_heartbeat_seconds = min(
@@ -86,6 +95,7 @@ class SysadminService:
         return sorted(self.repository.list_hosts(), key=lambda item: item.name)
 
     def create_host(self, host_input: HostInput, actor: str = "system") -> Host:
+        self._validate_host_input(host_input)
         now = utc_now()
         host = Host(
             **host_input.model_dump(),
@@ -110,6 +120,7 @@ class SysadminService:
         actor: str,
     ) -> Host:
         current = self._host(host_id)
+        self._validate_host_input(host_input)
         updated = Host(
             **host_input.model_dump(),
             id=current.id,
@@ -180,6 +191,20 @@ class SysadminService:
     def list_remediations(self) -> List[Remediation]:
         return sorted(
             self.repository.list_remediations(),
+            key=lambda item: item.created_at,
+            reverse=True,
+        )
+
+    def list_rollback_snapshots(
+        self,
+        host_id: Optional[str] = None,
+        remediation_id: Optional[str] = None,
+    ) -> List[RollbackSnapshot]:
+        return sorted(
+            self.repository.list_rollback_snapshots(
+                host_id=host_id,
+                remediation_id=remediation_id,
+            ),
             key=lambda item: item.created_at,
             reverse=True,
         )
@@ -477,6 +502,10 @@ class SysadminService:
         with self.repository.transaction():
             remediation = self._remediation_for_update(remediation_id)
             host = self._host(remediation.host_id)
+            if self._host_has_active_rollback_failure(host.id):
+                raise ValueError(
+                    "Host has an unresolved rollback failure alert and cannot execute remediations"
+                )
             self._ensure_current_remediation_plan(remediation)
             approval_error = self._remediation_approval_error(remediation, host)
             if approval_error:
@@ -598,6 +627,23 @@ class SysadminService:
             )
             self._sync_campaigns_for_remediation(remediation.id)
             return failed
+        if self._host_has_active_rollback_failure(host.id):
+            message = (
+                "Host has an unresolved rollback failure alert and cannot execute remediations"
+            )
+            remediation.execution_state = "blocked"
+            remediation.updated_at = utc_now()
+            self.repository.save_remediation(remediation)
+            failed = self.fail_job(
+                job,
+                message,
+                host.id,
+                lease_owner=owner,
+                retryable=False,
+                category="safety_validation",
+            )
+            self._sync_campaigns_for_remediation(remediation.id)
+            return failed
         try:
             return await self._run_with_heartbeat(
                 job.id,
@@ -613,6 +659,7 @@ class SysadminService:
             return self._job(job_id)
         except Exception as error:
             retryable = not isinstance(error, NonRetryableJobError)
+            category = getattr(error, "category", "remediation_execution")
             error_text = self._redact_text(str(error), host.id)
             failed = self.fail_job(
                 job,
@@ -620,10 +667,16 @@ class SysadminService:
                 host.id,
                 lease_owner=owner,
                 retryable=retryable,
-                category=getattr(error, "category", "remediation_execution"),
+                category=category,
             )
             remediation.execution_state = (
-                "queued" if failed.status == "queued" else "failed"
+                "queued"
+                if failed.status == "queued"
+                else (
+                    "blocked"
+                    if category in ("approval_validation", "safety_validation")
+                    else "failed"
+                )
             )
             remediation.updated_at = utc_now()
             self.repository.save_remediation(remediation)
@@ -679,6 +732,20 @@ class SysadminService:
             self.repository.save_remediation(remediation)
             raise NonRetryableJobError(binding_error, "approval_validation")
 
+        rollback_snapshot: Optional[RollbackSnapshot] = None
+        if self._snapshot_required(host, remediation):
+            job.current_phase = "snapshot_create"
+            job.progress_percent = 25
+            job.updated_at = utc_now()
+            self._save_claimed_job(job, lease_owner)
+            self._assert_job_lease(job.id, lease_owner)
+            rollback_snapshot = await self._create_rollback_snapshot(
+                job,
+                remediation,
+                host,
+            )
+            self._assert_job_lease(job.id, lease_owner)
+
         job.current_phase = "ansible_execution"
         job.progress_percent = 30
         job.updated_at = utc_now()
@@ -686,9 +753,23 @@ class SysadminService:
         self._assert_job_lease(job.id, lease_owner)
         result = await self.executor.execute(host, remediation, job.id)
         self._assert_job_lease(job.id, lease_owner)
+        if result.success and rollback_snapshot:
+            result = await self._finish_snapshot_protected_execution(
+                job,
+                remediation,
+                host,
+                rollback_snapshot,
+                result,
+                lease_owner,
+            )
+            self._assert_job_lease(job.id, lease_owner)
         self.repository.save_log_events(result.events)
         remediation.result = result
-        remediation.execution_state = "succeeded" if result.success else "failed"
+        remediation.execution_state = (
+            "succeeded"
+            if result.success
+            else ("blocked" if rollback_snapshot else "failed")
+        )
         remediation.updated_at = utc_now()
         self.repository.save_remediation(remediation)
         if not result.success:
@@ -850,6 +931,134 @@ class SysadminService:
                 released.append(job)
         return released
 
+    def release_scheduled_snapshot_delete_jobs(
+        self,
+        now: Optional[datetime] = None,
+    ) -> List[DurableJob]:
+        current = now or utc_now()
+        released: List[DurableJob] = []
+        for job in self.repository.list_jobs():
+            if job.job_type != "snapshot_delete" or job.status != "scheduled":
+                continue
+            snapshot_id = str(job.result.get("rollback_snapshot_id") or "")
+            snapshot = self.repository.get_rollback_snapshot(snapshot_id)
+            if not snapshot or not snapshot.delete_after:
+                continue
+            if normalized_datetime(snapshot.delete_after) <= normalized_datetime(current):
+                job.status = "queued"
+                job.current_phase = None
+                job.updated_at = current
+                self.repository.save_job(job)
+                released.append(job)
+        return released
+
+    async def process_snapshot_delete(
+        self,
+        job_id: str,
+        worker_id: Optional[str] = None,
+    ) -> DurableJob:
+        owner = worker_id or new_id("worker")
+        claimed_at = utc_now()
+        job = self.repository.claim_job(
+            job_id,
+            owner,
+            claimed_at,
+            claimed_at + timedelta(seconds=self.job_lease_seconds),
+        )
+        if not job:
+            return self._job(job_id)
+        snapshot_id = str(job.result.get("rollback_snapshot_id") or "")
+        snapshot = self.repository.get_rollback_snapshot(snapshot_id)
+        if not snapshot:
+            return self.fail_job(
+                job,
+                "Rollback snapshot record not found",
+                job.host_id or "",
+                lease_owner=owner,
+                retryable=False,
+                category="snapshot_delete",
+            )
+        host = self._host(snapshot.host_id)
+        try:
+            return await self._run_with_heartbeat(
+                job.id,
+                owner,
+                lambda: self._process_claimed_snapshot_delete(
+                    job,
+                    snapshot,
+                    host,
+                    owner,
+                ),
+            )
+        except JobLeaseLost:
+            return self._job(job_id)
+        except Exception as error:
+            error_text = self._redact_text(str(error), host.id)
+            failed = self.fail_job(
+                job,
+                error_text,
+                host.id,
+                lease_owner=owner,
+                retryable=False,
+                category=getattr(error, "category", "snapshot_delete"),
+            )
+            snapshot.state = RollbackSnapshotState.DELETE_FAILED
+            snapshot.failure_summary = error_text[:2000]
+            snapshot.updated_at = utc_now()
+            self.repository.save_rollback_snapshot(snapshot)
+            return failed
+
+    async def _process_claimed_snapshot_delete(
+        self,
+        job: DurableJob,
+        snapshot: RollbackSnapshot,
+        host: Host,
+        lease_owner: str,
+    ) -> DurableJob:
+        job.current_phase = "snapshot_delete"
+        job.progress_percent = 50
+        job.updated_at = utc_now()
+        self._save_claimed_job(job, lease_owner)
+        result = await self.snapshot_provider.delete_snapshot(host, snapshot, job.id)
+        self.repository.save_log_events(result.events)
+        snapshot.updated_at = utc_now()
+        if not result.success:
+            snapshot.state = RollbackSnapshotState.DELETE_FAILED
+            snapshot.failure_summary = self._redact_text(result.summary, host.id)
+            self.repository.save_rollback_snapshot(snapshot)
+            self.create_alert(
+                severity=Severity.HIGH,
+                title="Snapshot delete failed",
+                message=result.summary,
+                host_id=host.id,
+                job_id=job.id,
+            )
+            raise NonRetryableJobError(result.summary, "snapshot_delete")
+        snapshot.state = RollbackSnapshotState.DELETED
+        snapshot.failure_summary = None
+        self.repository.save_rollback_snapshot(snapshot)
+        job.status = "completed"
+        job.current_phase = "completed"
+        job.progress_percent = 100
+        job.result = {
+            **job.result,
+            "success": True,
+            "rollback_snapshot_id": snapshot.id,
+        }
+        job.completed_at = utc_now()
+        job.updated_at = utc_now()
+        job.lease_owner = None
+        job.lease_expires_at = None
+        self._save_claimed_job(job, lease_owner)
+        self.audit(
+            "system",
+            "snapshot.deleted",
+            "rollback_snapshot",
+            snapshot.id,
+            {"job_id": job.id},
+        )
+        return job
+
     def recover_expired_jobs(
         self,
         now: Optional[datetime] = None,
@@ -870,6 +1079,14 @@ class SysadminService:
                     remediation.execution_state = "queued"
                     remediation.updated_at = current
                     self.repository.save_remediation(remediation)
+            elif job.job_type == "snapshot_delete":
+                snapshot = self.repository.get_rollback_snapshot(
+                    str(job.result.get("rollback_snapshot_id") or "")
+                )
+                if snapshot and snapshot.state == RollbackSnapshotState.DELETE_FAILED:
+                    snapshot.state = RollbackSnapshotState.DELETE_SCHEDULED
+                    snapshot.updated_at = current
+                    self.repository.save_rollback_snapshot(snapshot)
             self.audit(
                 "scheduler",
                 "job.lease_recovered",
@@ -891,6 +1108,15 @@ class SysadminService:
                     remediation.execution_state = "failed"
                     remediation.updated_at = current
                     self.repository.save_remediation(remediation)
+            elif job.job_type == "snapshot_delete":
+                snapshot = self.repository.get_rollback_snapshot(
+                    str(job.result.get("rollback_snapshot_id") or "")
+                )
+                if snapshot:
+                    snapshot.state = RollbackSnapshotState.DELETE_FAILED
+                    snapshot.failure_summary = job.error
+                    snapshot.updated_at = current
+                    self.repository.save_rollback_snapshot(snapshot)
             self._record_terminal_job_failure(job, job.host_id)
         return recovered
 
@@ -1371,6 +1597,206 @@ class SysadminService:
             },
         )
 
+    async def _create_rollback_snapshot(
+        self,
+        job: DurableJob,
+        remediation: Remediation,
+        host: Host,
+    ) -> RollbackSnapshot:
+        now = utc_now()
+        snapshot = RollbackSnapshot(
+            id=new_id("rollback-snapshot"),
+            host_id=host.id,
+            remediation_id=remediation.id,
+            provider=SnapshotPlatform(host.snapshot_platform),
+            state=RollbackSnapshotState.CREATING,
+            created_at=now,
+            updated_at=now,
+        )
+        self.repository.save_rollback_snapshot(snapshot)
+        result = await self.snapshot_provider.create_snapshot(
+            host,
+            remediation,
+            snapshot,
+            job.id,
+        )
+        self.repository.save_log_events(result.events)
+        snapshot.updated_at = utc_now()
+        if not result.success:
+            snapshot.failure_summary = self._redact_text(result.summary, host.id)
+            self.repository.save_rollback_snapshot(snapshot)
+            raise NonRetryableJobError(
+                "Snapshot creation failed before package changes: %s"
+                % snapshot.failure_summary,
+                "safety_validation",
+            )
+        snapshot.external_snapshot_id = result.external_snapshot_id
+        snapshot.state = RollbackSnapshotState.CREATED
+        self.repository.save_rollback_snapshot(snapshot)
+        self.audit(
+            "system",
+            "snapshot.created",
+            "rollback_snapshot",
+            snapshot.id,
+            {
+                "host_id": host.id,
+                "remediation_id": remediation.id,
+                "provider": snapshot.provider,
+            },
+        )
+        return snapshot
+
+    async def _finish_snapshot_protected_execution(
+        self,
+        job: DurableJob,
+        remediation: Remediation,
+        host: Host,
+        snapshot: RollbackSnapshot,
+        result: Any,
+        lease_owner: str,
+    ) -> Any:
+        job.current_phase = "post_reboot_health_check"
+        job.progress_percent = 80
+        job.updated_at = utc_now()
+        self._save_claimed_job(job, lease_owner)
+        health = await self.snapshot_provider.run_health_checks(
+            host,
+            remediation,
+            snapshot,
+            job.id,
+        )
+        result.events.extend(health.events)
+        result.phases.append(
+            execution_phase(
+                "post_reboot_health_check",
+                "succeeded" if health.healthy else "failed",
+                health.summary,
+            )
+        )
+        snapshot.health_check_result = health.checks
+        snapshot.updated_at = utc_now()
+        if health.healthy:
+            snapshot.state = RollbackSnapshotState.DELETE_SCHEDULED
+            snapshot.delete_after = utc_now() + timedelta(
+                days=host.snapshot_retention_days
+            )
+            self.repository.save_rollback_snapshot(snapshot)
+            delete_job = self._schedule_snapshot_delete_job(snapshot, host)
+            result.phases.append(
+                execution_phase(
+                    "snapshot_delete_scheduled",
+                    "succeeded",
+                    "Snapshot deletion scheduled for %s."
+                    % snapshot.delete_after.isoformat(),
+                )
+            )
+            result.summary = (
+                "%s Snapshot deletion job %s is scheduled."
+                % (result.summary, delete_job.id)
+            )
+            return result
+
+        snapshot.state = RollbackSnapshotState.ROLLBACK_STARTED
+        snapshot.failure_summary = self._redact_text(health.summary, host.id)
+        self.repository.save_rollback_snapshot(snapshot)
+        rollback = await self.snapshot_provider.rollback_snapshot(
+            host,
+            remediation,
+            snapshot,
+            job.id,
+        )
+        result.events.extend(rollback.events)
+        result.phases.append(
+            execution_phase(
+                "snapshot_rollback",
+                "succeeded" if rollback.success else "failed",
+                rollback.summary,
+            )
+        )
+        snapshot.updated_at = utc_now()
+        snapshot.failure_summary = self._redact_text(rollback.summary, host.id)
+        if rollback.success:
+            snapshot.state = RollbackSnapshotState.ROLLED_BACK
+            self.repository.save_rollback_snapshot(snapshot)
+            self.create_alert(
+                severity=Severity.CRITICAL,
+                title="Snapshot rollback completed",
+                message=(
+                    "Post-reboot health checks failed. Snapshot rollback completed "
+                    "and human intervention is required."
+                ),
+                host_id=host.id,
+                job_id=job.id,
+            )
+            result.success = False
+            result.summary = (
+                "Post-reboot health checks failed; snapshot rollback completed "
+                "and human intervention is required."
+            )
+        else:
+            snapshot.state = RollbackSnapshotState.ROLLBACK_FAILED
+            self.repository.save_rollback_snapshot(snapshot)
+            self.create_alert(
+                severity=Severity.CRITICAL,
+                title="Snapshot rollback failed",
+                message=(
+                    "Post-reboot health checks failed and snapshot rollback failed. "
+                    "Block further execution until human intervention is complete."
+                ),
+                host_id=host.id,
+                job_id=job.id,
+            )
+            result.success = False
+            result.summary = (
+                "Post-reboot health checks failed and snapshot rollback failed; "
+                "human intervention is required."
+            )
+        result.failure_actions_taken.extend(
+            [
+                "snapshot rollback attempted",
+                "operator alert recorded",
+                "human intervention required",
+            ]
+        )
+        return result
+
+    def _schedule_snapshot_delete_job(
+        self,
+        snapshot: RollbackSnapshot,
+        host: Host,
+    ) -> DurableJob:
+        key = "snapshot-delete:%s" % snapshot.id
+        existing = self.repository.get_job_by_idempotency(key)
+        if existing:
+            return existing
+        now = utc_now()
+        job = DurableJob(
+            id=new_id("job"),
+            job_type="snapshot_delete",
+            status="scheduled",
+            host_id=host.id,
+            remediation_id=snapshot.remediation_id,
+            idempotency_key=key,
+            current_phase="waiting_for_retention",
+            result={
+                "rollback_snapshot_id": snapshot.id,
+                "delete_after": snapshot.delete_after.isoformat()
+                if snapshot.delete_after
+                else None,
+            },
+            created_at=now,
+            updated_at=now,
+        )
+        self.repository.save_job(job)
+        self.audit(
+            "system",
+            "snapshot.delete_scheduled",
+            "rollback_snapshot",
+            snapshot.id,
+            {"job_id": job.id, "delete_after": snapshot.delete_after},
+        )
+        return job
+
     async def _run_with_heartbeat(
         self,
         job_id: str,
@@ -1465,6 +1891,51 @@ class SysadminService:
         if not host:
             raise ValueError("Host not found")
         return host
+
+    def _validate_host_input(self, host_input: HostInput) -> None:
+        platform = SnapshotPlatform(host_input.snapshot_platform)
+        if platform == SnapshotPlatform.NONE:
+            return
+        if not host_input.snapshot_credential_id:
+            raise ValueError(
+                "Snapshot credential is required when rollback protection is configured"
+            )
+        if not host_input.snapshot_target_id and not host_input.snapshot_provider_metadata:
+            raise ValueError(
+                "Snapshot target ID or provider metadata is required when rollback protection is configured"
+            )
+        record = self.repository.get_credential_record(
+            host_input.snapshot_credential_id
+        )
+        if not record:
+            raise ValueError("Snapshot credential not found")
+        credential = record[0]
+        allowed_types = SNAPSHOT_CREDENTIAL_TYPES.get(platform, set())
+        credential_type = CredentialType(credential.credential_type)
+        if credential_type not in allowed_types:
+            allowed = ", ".join(sorted(item.value for item in allowed_types))
+            raise ValueError(
+                "Snapshot credential type must match %s. Allowed type(s): %s"
+                % (platform.value, allowed)
+            )
+        if (
+            platform == SnapshotPlatform.AWS
+            and credential_type == CredentialType.AWS_ROLE
+            and not (
+                credential.metadata.get("roleArn")
+                or credential.metadata.get("role_arn")
+            )
+        ):
+            raise ValueError("AWS role credentials require roleArn metadata")
+
+    def _host_has_active_rollback_failure(self, host_id: str) -> bool:
+        return any(
+            alert.host_id == host_id
+            and not alert.acknowledged
+            and severity_text(alert.severity) == "critical"
+            and "rollback" in alert.title.lower()
+            for alert in self.repository.list_alerts()
+        )
 
     def _scan(self, scan_id: Optional[str]) -> ScanJob:
         scan = self.repository.get_scan(scan_id or "")
@@ -2006,6 +2477,13 @@ class SysadminService:
         self._sync_campaign(campaign)
 
     @staticmethod
+    def _snapshot_required(host: Host, remediation: Remediation) -> bool:
+        return (
+            remediation.reboot_assessment.status != "not_expected"
+            and SnapshotPlatform(host.snapshot_platform) != SnapshotPlatform.NONE
+        )
+
+    @staticmethod
     def _remediation_binding_error(
         job: DurableJob,
         remediation: Remediation,
@@ -2083,6 +2561,10 @@ def material_state_changed(previous, current) -> bool:
     )
 
 
+def execution_phase(name: str, state: str, summary: str) -> ExecutionPhase:
+    return ExecutionPhase(name=name, state=state, summary=summary)
+
+
 def severity_text(value: Any) -> str:
     return value.value if isinstance(value, Severity) else str(value)
 
@@ -2091,7 +2573,17 @@ def execution_failure_category(summary: str) -> str:
     lowered = summary.lower()
     if "approv" in lowered or "plan" in lowered:
         return "approval_validation"
-    if "host key" in lowered or "blocked" in lowered:
+    if any(
+        marker in lowered
+        for marker in (
+            "host key",
+            "blocked",
+            "snapshot",
+            "rollback",
+            "health check",
+            "human intervention",
+        )
+    ):
         return "safety_validation"
     return "remediation_execution"
 
@@ -2108,6 +2600,10 @@ def execution_failure_is_non_retryable(summary: str, changed: bool) -> bool:
             "execution blocked",
             "reboot scope",
             "policy forbids",
+            "snapshot",
+            "rollback",
+            "health check",
+            "human intervention",
         )
     )
 

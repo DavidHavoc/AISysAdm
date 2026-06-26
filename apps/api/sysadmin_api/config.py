@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     execution_mode: str = "simulate"
     data_dir: Path = Path(".data")
     ansible_playbook_dir: Path = Path("ops/ansible/playbooks")
+    ansible_snapshot_playbook_dir: Path = Path("ops/ansible/snapshot")
     ansible_callback_dir: Path = Path("ops/ansible/callback_plugins")
     agent_contract_dir: Path = Path("agents")
     max_evidence_bytes_per_source: int = 65536

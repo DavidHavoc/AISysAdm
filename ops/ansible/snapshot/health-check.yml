@@ -1,0 +1,41 @@
+---
+- name: Deterministic post-reboot health checks
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Verify SSH command execution
+      ansible.builtin.ping:
+
+    - name: Check configured critical service
+      ansible.builtin.command:
+        cmd: "systemctl is-active {{ critical_service_name }}"
+      changed_when: false
+      register: critical_service_check
+      when: critical_service_name | default('') | length > 0
+
+    - name: Emit critical service result
+      ansible.builtin.debug:
+        msg: "health_check.critical_service=passed"
+      when: critical_service_name | default('') | length > 0
+
+    - name: Check configured health URL
+      ansible.builtin.uri:
+        url: "{{ health_check_url }}"
+        method: GET
+        status_code:
+          - 200
+          - 204
+          - 301
+          - 302
+        timeout: 15
+      register: health_url_check
+      when: health_check_url | default('') | length > 0
+
+    - name: Emit health URL result
+      ansible.builtin.debug:
+        msg: "health_check.health_url=passed"
+      when: health_check_url | default('') | length > 0
+
+    - name: Emit SSH result
+      ansible.builtin.debug:
+        msg: "health_check.ssh_reachable=passed"

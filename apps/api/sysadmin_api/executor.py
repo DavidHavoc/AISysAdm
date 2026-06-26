@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import tempfile
 from abc import ABC, abstractmethod
@@ -32,6 +31,8 @@ PLAYBOOK_CATALOG = {
     "validate": "post-patch-validation.yml",
     "recovery": "recovery-diagnostics.yml",
 }
+SUPPORTED_ACTION_TYPES = {"package_upgrade"}
+SUPPORTED_UPDATE_SCOPES = {"security", "all"}
 
 
 class RemediationExecutor(ABC):
@@ -481,6 +482,10 @@ def approval_guard(host: Host, remediation: Remediation) -> str:
         return "Execution blocked because the remediation is not approved"
     if remediation.approval_scope != "patch_only":
         return "Execution blocked because the approval scope is invalid"
+    if remediation.action_type not in SUPPORTED_ACTION_TYPES:
+        return "Execution blocked because the remediation action type is not cataloged"
+    if remediation.update_scope not in SUPPORTED_UPDATE_SCOPES:
+        return "Execution blocked because the remediation update scope is not cataloged"
     if not remediation.approved_by or not remediation.approved_at:
         return "Execution blocked because approval metadata is incomplete"
     if (

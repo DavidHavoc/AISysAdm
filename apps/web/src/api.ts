@@ -13,6 +13,7 @@ import type {
   LogPage,
   PatchCampaign,
   Remediation,
+  RollbackSnapshot,
   ScanJob,
   SshCredential,
   StructuredLogEvent,
@@ -157,6 +158,15 @@ export const api = {
     form.append("key", file);
     return request<SshCredential>("/credentials", { method: "POST", body: form });
   },
+  createPlatformCredential: (
+    name: string,
+    credentialType: SshCredential["credentialType"],
+    secret: string,
+    metadata: Record<string, unknown>
+  ) => request<SshCredential>("/credentials", {
+    method: "POST",
+    body: JSON.stringify({ name, credentialType, secret, metadata })
+  }),
   deleteCredential: (credentialId: string) =>
     request<void>(`/credentials/${credentialId}`, { method: "DELETE" }),
   listHosts: () => request<Host[]>("/hosts"),
@@ -184,6 +194,8 @@ export const api = {
     hostId ? `/hosts/${hostId}/findings` : "/findings"
   ),
   listRemediations: () => request<Remediation[]>("/remediations"),
+  listSnapshots: (filters: { hostId?: string; remediationId?: string } = {}) =>
+    request<RollbackSnapshot[]>(`/snapshots${query(filters)}`),
   approveRemediation: (
     remediationId: string,
     planVersion: number,

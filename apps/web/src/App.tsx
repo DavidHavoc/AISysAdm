@@ -15,6 +15,7 @@ import type {
   LogPage,
   PatchCampaign,
   Remediation,
+  RollbackSnapshot,
   SshCredential,
   StructuredLogEvent,
   User
@@ -33,6 +34,13 @@ type HostFormState = {
   availabilityClass: HostInput["availabilityClass"];
   credentialId: string;
   sshHostKeyFingerprint: string;
+  snapshotPlatform: HostInput["snapshotPlatform"];
+  snapshotCredentialId: string;
+  snapshotTargetId: string;
+  snapshotProviderMetadata: string;
+  criticalServiceName: string;
+  healthCheckUrl: string;
+  snapshotRetentionDays: string;
   maxBatchSize: string;
   canaryCount: string;
   updateMode: HostInput["patchPolicy"]["updateMode"];
@@ -79,6 +87,13 @@ const blankHostForm: HostFormState = {
   availabilityClass: "standard",
   credentialId: "",
   sshHostKeyFingerprint: "",
+  snapshotPlatform: "none",
+  snapshotCredentialId: "",
+  snapshotTargetId: "",
+  snapshotProviderMetadata: "{}",
+  criticalServiceName: "",
+  healthCheckUrl: "",
+  snapshotRetentionDays: "7",
   maxBatchSize: "5",
   canaryCount: "1",
   updateMode: "orchestrator_decides",
@@ -209,6 +224,13 @@ export function hostFormFromHost(host: Host): HostFormState {
     availabilityClass: host.availabilityClass,
     credentialId: host.credentialId ?? "",
     sshHostKeyFingerprint: host.sshHostKeyFingerprint ?? "",
+    snapshotPlatform: host.snapshotPlatform ?? "none",
+    snapshotCredentialId: host.snapshotCredentialId ?? "",
+    snapshotTargetId: host.snapshotTargetId ?? "",
+    snapshotProviderMetadata: JSON.stringify(host.snapshotProviderMetadata ?? {}, null, 2),
+    criticalServiceName: host.criticalServiceName ?? "",
+    healthCheckUrl: host.healthCheckUrl ?? "",
+    snapshotRetentionDays: String(host.snapshotRetentionDays ?? 7),
     maxBatchSize: String(host.patchPolicy.maxBatchSize),
     canaryCount: String(host.patchPolicy.canaryCount),
     updateMode: host.patchPolicy.updateMode,
@@ -233,6 +255,13 @@ export function hostInputFromForm(form: HostFormState): HostInput {
     availabilityClass: form.availabilityClass,
     credentialId: form.credentialId || null,
     sshHostKeyFingerprint: form.sshHostKeyFingerprint || null,
+    snapshotPlatform: form.snapshotPlatform,
+    snapshotCredentialId: form.snapshotCredentialId || null,
+    snapshotTargetId: form.snapshotTargetId || null,
+    snapshotProviderMetadata: parseJsonObject(form.snapshotProviderMetadata),
+    criticalServiceName: form.criticalServiceName || null,
+    healthCheckUrl: form.healthCheckUrl || null,
+    snapshotRetentionDays: Number(form.snapshotRetentionDays || 7),
     patchPolicy: {
       updateMode: form.updateMode,
       executionTiming: form.executionTiming,
@@ -270,6 +299,28 @@ function credentialLabel(credentials: SshCredential[], credentialId?: string | n
   return credentials.find((credential) => credential.id === credentialId)?.name ?? credentialId;
 }
 
+function snapshotCredentialAllowed(
+  platform: HostInput["snapshotPlatform"],
+  credential: SshCredential,
+) {
+  const credentialType = credential.credentialType ?? "ssh_private_key";
+  if (platform === "proxmox") return credentialType === "proxmox_token";
+  if (platform === "aws") return credentialType === "aws_access_key" || credentialType === "aws_role";
+  if (platform === "vmware") return credentialType === "vmware_secret";
+  if (platform === "libvirt") return credentialType === "libvirt_ssh";
+  return false;
+}
+
+function parseJsonObject(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return {};
+  const parsed = JSON.parse(trimmed) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Provider metadata must be a JSON object.");
+  }
+  return parsed as Record<string, unknown>;
+}
+
 export function App() {
   const [user, setUser] = useState<User | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
@@ -282,8 +333,12 @@ export function App() {
   const [editingHostId, setEditingHostId] = useState<string | null>(null);
   const [credentialName, setCredentialName] = useState("");
   const [credentialFile, setCredentialFile] = useState<File | null>(null);
+  const [credentialType, setCredentialType] = useState<SshCredential["credentialType"]>("ssh_private_key");
+  const [credentialSecret, setCredentialSecret] = useState("");
+  const [credentialMetadata, setCredentialMetadata] = useState("{}");
   const [findings, setFindings] = useState<Finding[]>([]);
   const [remediations, setRemediations] = useState<Remediation[]>([]);
+  const [snapshots, setSnapshots] = useState<RollbackSnapshot[]>([]);
   const [selectedRemediationId, setSelectedRemediationId] = useState("");
   const [executionConfirmation, setExecutionConfirmation] = useState("");
   const [campaigns, setCampaigns] = useState<PatchCampaign[]>([]);
@@ -340,6 +395,9 @@ export function App() {
   const selectedRemediationHost = selectedRemediation
     ? hosts.find((host) => host.id === selectedRemediation.hostId) ?? null
     : null;
+  const selectedRemediationSnapshots = selectedRemediation
+    ? snapshots.filter((snapshot) => snapshot.remediationId === selectedRemediation.id)
+    : [];
   const selectedRemediationBlockers = selectedRemediation
     ? remediationExecutionBlockers(selectedRemediation, selectedRemediationHost)
     : [];
@@ -408,6 +466,7 @@ export function App() {
         nextCredentials,
         nextHosts,
         nextRemediations,
+        nextSnapshots,
         nextCampaigns,
         nextSchedules,
         nextJobs,
@@ -420,6 +479,7 @@ export function App() {
         api.listCredentials(),
         api.listHosts(),
         api.listRemediations(),
+        api.listSnapshots(),
         api.listCampaigns(),
         api.listSchedules(),
         api.listJobs(),
@@ -432,6 +492,7 @@ export function App() {
       setCredentials(nextCredentials);
       setHosts(nextHosts);
       setRemediations(nextRemediations);
+      setSnapshots(nextSnapshots);
       setCampaigns(nextCampaigns);
       setSchedules(nextSchedules);
       setJobs(nextJobs);
@@ -525,6 +586,7 @@ export function App() {
     setHosts([]);
     setFindings([]);
     setRemediations([]);
+    setSnapshots([]);
     setCampaigns([]);
     setSchedules([]);
     setJobs([]);
@@ -549,7 +611,13 @@ export function App() {
 
   async function submitHost(event: FormEvent) {
     event.preventDefault();
-    const input = hostInputFromForm(hostForm);
+    let input: HostInput;
+    try {
+      input = hostInputFromForm(hostForm);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Invalid host form");
+      return;
+    }
     await act(editingHostId ? `host-save-${editingHostId}` : "host-create", async () => {
       if (editingHostId) {
         await api.updateHost(editingHostId, input);
@@ -572,14 +640,32 @@ export function App() {
 
   async function uploadCredential(event: FormEvent) {
     event.preventDefault();
-    if (!credentialFile) {
+    if (credentialType === "ssh_private_key" && !credentialFile) {
       setError("Choose a private key file before uploading a credential.");
       return;
     }
+    let metadata: Record<string, unknown>;
+    try {
+      metadata = parseJsonObject(credentialMetadata);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Invalid credential metadata");
+      return;
+    }
     await act("credential-upload", async () => {
-      await api.uploadCredential(credentialName.trim(), credentialFile);
+      if (credentialType === "ssh_private_key") {
+        await api.uploadCredential(credentialName.trim(), credentialFile as File);
+      } else {
+        await api.createPlatformCredential(
+          credentialName.trim(),
+          credentialType,
+          credentialSecret,
+          metadata,
+        );
+      }
       setCredentialName("");
       setCredentialFile(null);
+      setCredentialSecret("");
+      setCredentialMetadata("{}");
     });
   }
 
@@ -813,7 +899,7 @@ export function App() {
 
       <section className="summary-grid" aria-label="Dashboard summary">
         <Metric label="Hosts" value={hosts.length} detail={`${hosts.filter((host) => host.connectionStatus === "ready").length} ready`} />
-        <Metric label="Credentials" value={credentials.length} detail="SSH keys" />
+        <Metric label="Credentials" value={credentials.length} detail="vault records" />
         <Metric label="Jobs" value={jobs.length} detail={`${jobs.filter((job) => job.status === "running").length} running`} />
         <Metric label="Alerts" value={alerts.filter((alert) => !alert.acknowledged).length} detail="unacknowledged" />
       </section>
@@ -825,7 +911,7 @@ export function App() {
             onClick={() => setActiveView("fleet")}
           >
             <strong>Fleet Setup</strong>
-            <small>{hosts.length} hosts, {credentials.length} keys</small>
+            <small>{hosts.length} hosts, {credentials.length} credentials</small>
           </button>
           <button
             className={activeView === "operations" ? "nav-button active" : "nav-button"}
@@ -862,7 +948,7 @@ export function App() {
       <section className={`dashboard-grid dashboard-${activeView}`}>
         {activeView === "fleet" ? (
           <>
-        <SecondaryPanel title="SSH Keys">
+        <SecondaryPanel title="Credentials">
           <form className="inline-form" onSubmit={(event) => void uploadCredential(event)}>
             <input
               aria-label="Credential name"
@@ -870,21 +956,52 @@ export function App() {
               value={credentialName}
               onChange={(event) => setCredentialName(event.target.value)}
             />
-            <input
-              aria-label="Private key"
-              type="file"
-              onChange={(event) => setCredentialFile(event.target.files?.[0] ?? null)}
-            />
+            <select
+              aria-label="Credential type"
+              value={credentialType}
+              onChange={(event) => setCredentialType(event.target.value as SshCredential["credentialType"])}
+            >
+              <option value="ssh_private_key">ssh private key</option>
+              <option value="proxmox_token">proxmox token</option>
+              <option value="aws_access_key">aws access key</option>
+              <option value="aws_role">aws role</option>
+              <option value="vmware_secret">vmware secret</option>
+              <option value="libvirt_ssh">libvirt ssh</option>
+            </select>
+            {credentialType === "ssh_private_key" ? (
+              <input
+                aria-label="Private key"
+                type="file"
+                onChange={(event) => setCredentialFile(event.target.files?.[0] ?? null)}
+              />
+            ) : (
+              <>
+                <input
+                  aria-label="Credential secret"
+                  placeholder={credentialType === "aws_role" ? "optional secret" : "credential secret"}
+                  type="password"
+                  value={credentialSecret}
+                  onChange={(event) => setCredentialSecret(event.target.value)}
+                />
+                <input
+                  aria-label="Credential metadata"
+                  placeholder='{"endpoint":"https://example"}'
+                  value={credentialMetadata}
+                  onChange={(event) => setCredentialMetadata(event.target.value)}
+                />
+              </>
+            )}
             <button className="primary-button" disabled={busy === "credential-upload"} type="submit">
-              Upload
+              Add
             </button>
           </form>
           <div className="list-stack">
-            {credentials.length === 0 ? <p>No SSH credentials uploaded.</p> : null}
+            {credentials.length === 0 ? <p>No credentials stored.</p> : null}
             {credentials.map((credential) => (
               <div key={credential.id} className="record-row">
                 <div>
                   <strong>{credential.name}</strong>
+                  <small>{(credential.credentialType ?? "ssh_private_key").replaceAll("_", " ")}</small>
                   <small>{credential.fingerprint}</small>
                   <small>Last used: {formatDate(credential.lastUsedAt)}</small>
                 </div>
@@ -930,7 +1047,7 @@ export function App() {
               Credential
               <select value={hostForm.credentialId} onChange={(event) => setHostForm({ ...hostForm, credentialId: event.target.value })}>
                 <option value="">None</option>
-                {credentials.map((credential) => (
+                {credentials.filter((credential) => (credential.credentialType ?? "ssh_private_key") === "ssh_private_key").map((credential) => (
                   <option key={credential.id} value={credential.id}>{credential.name}</option>
                 ))}
               </select>
@@ -983,6 +1100,49 @@ export function App() {
             <label className="wide-field">
               SSH host key fingerprint
               <input value={hostForm.sshHostKeyFingerprint} onChange={(event) => setHostForm({ ...hostForm, sshHostKeyFingerprint: event.target.value })} />
+            </label>
+            <label>
+              Snapshot platform
+              <select value={hostForm.snapshotPlatform} onChange={(event) => setHostForm({ ...hostForm, snapshotPlatform: event.target.value as HostInput["snapshotPlatform"], snapshotCredentialId: "" })}>
+                <option value="none">none</option>
+                <option value="proxmox">proxmox</option>
+                <option value="aws">aws</option>
+                <option value="vmware">vmware</option>
+                <option value="libvirt">libvirt</option>
+              </select>
+            </label>
+            <label>
+              Snapshot credential
+              <select
+                value={hostForm.snapshotCredentialId}
+                disabled={hostForm.snapshotPlatform === "none"}
+                onChange={(event) => setHostForm({ ...hostForm, snapshotCredentialId: event.target.value })}
+              >
+                <option value="">None</option>
+                {credentials.filter((credential) => snapshotCredentialAllowed(hostForm.snapshotPlatform, credential)).map((credential) => (
+                  <option key={credential.id} value={credential.id}>{credential.name}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Snapshot target
+              <input value={hostForm.snapshotTargetId} onChange={(event) => setHostForm({ ...hostForm, snapshotTargetId: event.target.value })} />
+            </label>
+            <label>
+              Critical service
+              <input value={hostForm.criticalServiceName} onChange={(event) => setHostForm({ ...hostForm, criticalServiceName: event.target.value })} />
+            </label>
+            <label>
+              Health URL
+              <input value={hostForm.healthCheckUrl} onChange={(event) => setHostForm({ ...hostForm, healthCheckUrl: event.target.value })} />
+            </label>
+            <label>
+              Retention days
+              <input type="number" min="1" max="365" value={hostForm.snapshotRetentionDays} onChange={(event) => setHostForm({ ...hostForm, snapshotRetentionDays: event.target.value })} />
+            </label>
+            <label className="wide-field">
+              Snapshot metadata
+              <textarea value={hostForm.snapshotProviderMetadata} onChange={(event) => setHostForm({ ...hostForm, snapshotProviderMetadata: event.target.value })} />
             </label>
             <div className="action-row">
               <button className="primary-button" type="submit">
@@ -1043,6 +1203,12 @@ export function App() {
                 <div><dt>Status</dt><dd>{selectedHost.connectionStatus}</dd></div>
                 <div><dt>Credential</dt><dd>{credentialLabel(credentials, selectedHost.credentialId)}</dd></div>
                 <div><dt>Saved host key</dt><dd>{selectedHost.sshHostKeyFingerprint ?? "None"}</dd></div>
+                <div><dt>Snapshot platform</dt><dd>{selectedHost.snapshotPlatform ?? "none"}</dd></div>
+                <div><dt>Snapshot credential</dt><dd>{credentialLabel(credentials, selectedHost.snapshotCredentialId)}</dd></div>
+                <div><dt>Snapshot target</dt><dd>{selectedHost.snapshotTargetId ?? "None"}</dd></div>
+                <div><dt>Critical service</dt><dd>{selectedHost.criticalServiceName ?? "None"}</dd></div>
+                <div><dt>Health URL</dt><dd>{selectedHost.healthCheckUrl ?? "None"}</dd></div>
+                <div><dt>Retention</dt><dd>{selectedHost.snapshotRetentionDays ?? 7} days</dd></div>
               </div>
               <div className="action-row">
                 <button className="primary-button" onClick={() => void testConnection()}>
@@ -1160,9 +1326,11 @@ export function App() {
             runScan={runScan}
             busy={busy}
             remediations={remediations}
+            snapshots={snapshots}
             hosts={hosts}
             selectedRemediation={selectedRemediation}
             selectedRemediationHost={selectedRemediationHost}
+            selectedRemediationSnapshots={selectedRemediationSnapshots}
             selectedRemediationBlockers={selectedRemediationBlockers}
             setSelectedRemediationId={setSelectedRemediationId}
             executionConfirmation={executionConfirmation}
@@ -1488,9 +1656,11 @@ function OperationsView(props: {
   runScan: (hostId: string) => Promise<void>;
   busy: string;
   remediations: Remediation[];
+  snapshots: RollbackSnapshot[];
   hosts: Host[];
   selectedRemediation: Remediation | null;
   selectedRemediationHost: Host | null;
+  selectedRemediationSnapshots: RollbackSnapshot[];
   selectedRemediationBlockers: string[];
   setSelectedRemediationId: (remediationId: string) => void;
   executionConfirmation: string;
@@ -2032,8 +2202,32 @@ function OperationsView(props: {
                       <div><dt>Downtime</dt><dd>{props.selectedRemediation.rebootAssessment.estimatedDowntimeMinutes} min</dd></div>
                       <div><dt>Execution timing</dt><dd>{props.selectedRemediation.executionTiming.replaceAll("_", " ")}</dd></div>
                       <div><dt>Failure policy</dt><dd>{props.selectedRemediation.failurePolicy.notifyOperator ? "notify operator" : "no notification"}</dd></div>
+                      <div><dt>Snapshot protection</dt><dd>{props.selectedRemediationHost?.snapshotPlatform && props.selectedRemediationHost.snapshotPlatform !== "none" ? props.selectedRemediationHost.snapshotPlatform : "not configured"}</dd></div>
+                      <div><dt>Snapshot status</dt><dd>{props.selectedRemediationSnapshots[0]?.state ?? "none"}</dd></div>
                     </div>
                     <p className="muted-text">{props.selectedRemediation.rebootAssessment.rationale}</p>
+                    {props.selectedRemediationSnapshots.length > 0 ? (
+                      <div className="list-stack">
+                        {props.selectedRemediationSnapshots.map((snapshot) => (
+                          <div key={snapshot.id} className="record-block">
+                            <div className="chip-row">
+                              <span className={statusClass(snapshot.state)}>{snapshot.state}</span>
+                              <span className="status-chip">{snapshot.provider}</span>
+                            </div>
+                            <div className="detail-grid">
+                              <div><dt>Snapshot</dt><dd>{snapshot.id}</dd></div>
+                              <div><dt>External ID</dt><dd>{snapshot.externalSnapshotId ?? "None"}</dd></div>
+                              <div><dt>Delete after</dt><dd>{formatDate(snapshot.deleteAfter)}</dd></div>
+                              <div><dt>Updated</dt><dd>{formatDate(snapshot.updatedAt)}</dd></div>
+                            </div>
+                            {Object.keys(snapshot.healthCheckResult ?? {}).length ? (
+                              <pre>{JSON.stringify(snapshot.healthCheckResult, null, 2)}</pre>
+                            ) : null}
+                            {snapshot.failureSummary ? <small className="warning-text">{snapshot.failureSummary}</small> : null}
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
                     {props.selectedRemediationBlockers.length > 0 ? (
                       <div className="execution-blockers">
                         <strong>Before execution</strong>

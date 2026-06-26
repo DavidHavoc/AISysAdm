@@ -48,7 +48,13 @@ class CredentialRecord(Base):
 
     id: Mapped[str] = mapped_column(String(96), primary_key=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
+    credential_type: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="ssh_private_key",
+    )
     fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    credential_metadata: Mapped[dict] = mapped_column("metadata", JSON, nullable=False, default=dict)
     encrypted_key: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     nonce: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -91,6 +97,24 @@ class SnapshotRecord(Base):
     snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class RollbackSnapshotRecord(Base):
+    __tablename__ = "rollback_snapshots"
+
+    id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    host_id: Mapped[str] = mapped_column(String(96), nullable=False, index=True)
+    remediation_id: Mapped[str] = mapped_column(String(96), nullable=False, index=True)
+    provider: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    state: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    external_snapshot_id: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    delete_after: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class ScanRecord(Base):
