@@ -487,6 +487,10 @@ class InMemoryRepository(Repository):
                 job.lease_owner = None
                 job.lease_expires_at = None
                 job.updated_at = recovered_at
+                job.result = {
+                    **job.result,
+                    "recovered_from_phase": job.current_phase,
+                }
                 if job.attempts >= job.max_attempts:
                     terminalize_exhausted_job(job, recovered_at)
                     exhausted.append(job)
@@ -1283,6 +1287,10 @@ class SqlRepository(Repository):
                 job.lease_owner = None
                 job.lease_expires_at = None
                 job.updated_at = recovered_at
+                job.result = {
+                    **job.result,
+                    "recovered_from_phase": job.current_phase,
+                }
                 if job.attempts >= job.max_attempts:
                     terminalize_exhausted_job(job, recovered_at)
                     exhausted.append(job)

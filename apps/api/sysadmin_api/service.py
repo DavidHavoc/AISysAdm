@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import math
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, TypeVar
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
 
-from .agents import MultiAgentWorkflow, remediation_plan_hash
+from .agents import MultiAgentWorkflow
 from .collector import HostCollector
 from .credentials import SNAPSHOT_CREDENTIAL_TYPES
 from .executor import RemediationExecutor
@@ -33,7 +33,6 @@ from .models import (
     HostScheduleInput,
     JobFailure,
     LogPage,
-    MaintenanceWindow,
     PatchCampaign,
     Remediation,
     RollbackSnapshot,
@@ -48,6 +47,14 @@ from .models import (
 from .redaction import redact_text, sanitize_audit_details, sanitize_log_event
 from .repository import Repository, normalized_datetime
 from .snapshots import SimulatedSnapshotProvider, SnapshotProvider
+from .trusted_change import (
+    GateDecision,
+    GateDenied,
+    GateCode,
+    PlanReconciliation,
+    PostChangeAction,
+    TrustedChangeGate,
+)
 
 
 ResultT = TypeVar("ResultT")
@@ -414,27 +421,17 @@ class SysadminService:
     ) -> Remediation:
         remediation = self._remediation(remediation_id)
         host = self._host(remediation.host_id)
-        self._ensure_current_remediation_plan(remediation)
-        if remediation.approval_state != "pending":
-            raise ValueError("Only pending remediations can be approved")
-        self._validate_approval_request(host, remediation, request)
+        _, remediation = self._ensure_current_remediation_plan(remediation)
         now = utc_now()
-        remediation.approval_state = "approved"
-        remediation.approved_by = actor
-        remediation.approved_at = now
-        remediation.approved_plan_version = remediation.plan_version
-        remediation.approved_plan_hash = remediation.plan_hash
-        remediation.reboot_approval_state = (
-            "not_required"
-            if remediation.reboot_assessment.status == "not_expected"
-            else "pending"
+        transition = TrustedChangeGate.approve_plan(
+            remediation,
+            host,
+            request,
+            actor,
+            now,
         )
-        remediation.reboot_approved_by = None
-        remediation.reboot_approved_at = None
-        remediation.reboot_approved_plan_version = None
-        remediation.reboot_approved_plan_hash = None
-        remediation.reboot_assessment.approved_if_required = False
-        remediation.updated_at = now
+        self._raise_gate_denial(transition.decision)
+        remediation = transition.remediation
         self.repository.save_remediation(remediation)
         self.audit(
             actor,
@@ -457,27 +454,21 @@ class SysadminService:
     ) -> Remediation:
         remediation = self._remediation(remediation_id)
         host = self._host(remediation.host_id)
-        self._ensure_current_remediation_plan(remediation)
-        if remediation.approval_state != "approved":
-            raise ValueError("The remediation plan must be approved before reboot approval")
-        self._validate_approval_request(host, remediation, request)
-        if remediation.reboot_assessment.status == "not_expected":
-            raise ValueError("This remediation does not require reboot approval")
-        if host.patch_policy.reboot_policy == "never":
-            remediation.reboot_approval_state = "blocked"
-            remediation.execution_state = "blocked"
-            remediation.updated_at = utc_now()
-            self.repository.save_remediation(remediation)
-            self._sync_campaigns_for_remediation(remediation.id)
-            raise ValueError("Host policy forbids reboot risk that cannot be excluded")
+        _, remediation = self._ensure_current_remediation_plan(remediation)
         now = utc_now()
-        remediation.reboot_approval_state = "approved"
-        remediation.reboot_approved_by = actor
-        remediation.reboot_approved_at = now
-        remediation.reboot_approved_plan_version = remediation.plan_version
-        remediation.reboot_approved_plan_hash = remediation.plan_hash
-        remediation.reboot_assessment.approved_if_required = True
-        remediation.updated_at = now
+        transition = TrustedChangeGate.approve_reboot(
+            remediation,
+            host,
+            request,
+            actor,
+            now,
+        )
+        remediation = transition.remediation
+        if not transition.decision.allowed:
+            if remediation != self._remediation(remediation_id):
+                self.repository.save_remediation(remediation)
+                self._sync_campaigns_for_remediation(remediation.id)
+            self._raise_gate_denial(transition.decision)
         self.repository.save_remediation(remediation)
         self.audit(
             actor,
@@ -502,14 +493,11 @@ class SysadminService:
         with self.repository.transaction():
             remediation = self._remediation_for_update(remediation_id)
             host = self._host(remediation.host_id)
-            if self._host_has_active_rollback_failure(host.id):
-                raise ValueError(
-                    "Host has an unresolved rollback failure alert and cannot execute remediations"
-                )
-            self._ensure_current_remediation_plan(remediation)
-            approval_error = self._remediation_approval_error(remediation, host)
-            if approval_error:
-                raise ValueError(approval_error)
+            eligibility, remediation = self._trusted_execution_decision(
+                remediation,
+                host,
+            )
+            self._raise_gate_denial(eligibility)
             now = utc_now()
             key = "remediation:%s:%s" % (
                 remediation.id,
@@ -517,38 +505,29 @@ class SysadminService:
             )
             existing = self.repository.get_job_by_idempotency(key)
             if existing:
-                if existing.campaign_id != campaign_id:
-                    raise ValueError(
-                        "This exact remediation plan already has an execution job"
-                    )
+                duplicate = TrustedChangeGate.duplicate_execution(
+                    existing,
+                    campaign_id,
+                )
+                self._raise_gate_denial(duplicate)
                 return existing
-            approval_scope = (
-                "patch_only"
-                if remediation.reboot_assessment.status == "not_expected"
-                else "patch_and_reboot_if_required"
-            )
+            timing = TrustedChangeGate.timing(remediation, now)
             job = DurableJob(
                 id=new_id("job"),
                 job_type="remediation",
-                status=(
-                    "queued"
-                    if self._timing_allows(remediation, now)
-                    else "scheduled"
-                ),
+                status=timing.job_status,
                 host_id=host.id,
                 scan_id=remediation.scan_id,
                 remediation_id=remediation.id,
                 campaign_id=campaign_id,
                 approved_plan_version=remediation.plan_version,
                 approved_plan_hash=remediation.plan_hash,
-                approval_scope=approval_scope,
+                approval_scope=TrustedChangeGate.job_approval_scope(remediation),
                 idempotency_key=key,
                 created_at=now,
                 updated_at=now,
             )
-            remediation.execution_state = (
-                "queued" if job.status == "queued" else "waiting_for_window"
-            )
+            remediation.execution_state = timing.remediation_state
             self.repository.save_remediation(remediation)
             self.repository.save_job(job)
             self.audit(
@@ -585,10 +564,8 @@ class SysadminService:
                     self.repository.save_remediation(remediation)
                     self._sync_campaigns_for_remediation(remediation.id)
                 return canceled or self._job(job_id)
-        if existing.status == "queued" and not self._timing_allows(
-            remediation,
-            utc_now(),
-        ):
+        timing = TrustedChangeGate.timing(remediation, utc_now())
+        if existing.status == "queued" and not timing.decision.allowed:
             existing.status = "scheduled"
             existing.current_phase = "waiting_for_maintenance_window"
             existing.updated_at = utc_now()
@@ -607,40 +584,44 @@ class SysadminService:
             return self._job(job_id)
         remediation = self._remediation(job.remediation_id)
         host = self._host(remediation.host_id)
-        plan_changed = self._ensure_current_remediation_plan(remediation)
-        binding_error = (
-            "Remediation approved plan content changed after approval"
-            if plan_changed
-            else self._remediation_binding_error(job, remediation, host)
+        if (
+            job.last_failure
+            and job.last_failure.category == "worker_lease_expired"
+        ):
+            recovery = TrustedChangeGate.stale_recovery(job, exhausted=False)
+            if not recovery.dispatch:
+                remediation.execution_state = recovery.remediation_state
+                remediation.updated_at = utc_now()
+                self.repository.save_remediation(remediation)
+                failed = self.fail_job(
+                    job,
+                    recovery.decision.message,
+                    host.id,
+                    lease_owner=owner,
+                    retryable=False,
+                    category=recovery.decision.category,
+                )
+                self._sync_campaigns_for_remediation(
+                    remediation.id,
+                    stop_remaining=True,
+                )
+                return failed
+        eligibility, remediation = self._trusted_execution_decision(
+            remediation,
+            host,
+            job,
         )
-        if binding_error:
+        if not eligibility.allowed:
             remediation.execution_state = "blocked"
             remediation.updated_at = utc_now()
             self.repository.save_remediation(remediation)
             failed = self.fail_job(
                 job,
-                binding_error,
+                eligibility.message,
                 host.id,
                 lease_owner=owner,
                 retryable=False,
-                category="approval_validation",
-            )
-            self._sync_campaigns_for_remediation(remediation.id)
-            return failed
-        if self._host_has_active_rollback_failure(host.id):
-            message = (
-                "Host has an unresolved rollback failure alert and cannot execute remediations"
-            )
-            remediation.execution_state = "blocked"
-            remediation.updated_at = utc_now()
-            self.repository.save_remediation(remediation)
-            failed = self.fail_job(
-                job,
-                message,
-                host.id,
-                lease_owner=owner,
-                retryable=False,
-                category="safety_validation",
+                category=eligibility.category,
             )
             self._sync_campaigns_for_remediation(remediation.id)
             return failed
@@ -669,6 +650,7 @@ class SysadminService:
                 retryable=retryable,
                 category=category,
             )
+            remediation = self._remediation(remediation.id)
             remediation.execution_state = (
                 "queued"
                 if failed.status == "queued"
@@ -704,10 +686,8 @@ class SysadminService:
         original_scan = self._scan(remediation.scan_id)
         original_snapshot = self.repository.get_snapshot(original_scan.snapshot_id or "")
         if not original_snapshot:
-            raise NonRetryableJobError(
-                "Approved scan snapshot is unavailable",
-                "approval_validation",
-            )
+            decision = TrustedChangeGate.drift(None, None)
+            raise NonRetryableJobError(decision.message, decision.category)
         current = await self.collector.collect(
             host,
             job.id,
@@ -716,24 +696,37 @@ class SysadminService:
         self._assert_job_lease(job.id, lease_owner)
         self.repository.save_snapshot(current.snapshot)
         self.repository.save_log_events(current.events)
-        if material_state_changed(original_snapshot, current.snapshot):
-            raise NonRetryableJobError(
-                "Host package, service, or reboot state changed after approval",
-                "safety_validation",
-            )
+        drift = TrustedChangeGate.drift(original_snapshot, current.snapshot)
+        if not drift.allowed:
+            raise NonRetryableJobError(drift.message, drift.category)
 
         remediation = self._remediation(job.remediation_id)
         host = self._host(remediation.host_id)
-        self._ensure_current_remediation_plan(remediation)
-        binding_error = self._remediation_binding_error(job, remediation, host)
-        if binding_error:
+        eligibility, remediation = self._trusted_execution_decision(
+            remediation,
+            host,
+            job,
+        )
+        if not eligibility.allowed:
             remediation.execution_state = "blocked"
             remediation.updated_at = utc_now()
             self.repository.save_remediation(remediation)
-            raise NonRetryableJobError(binding_error, "approval_validation")
+            raise NonRetryableJobError(
+                eligibility.message,
+                eligibility.category,
+            )
 
         rollback_snapshot: Optional[RollbackSnapshot] = None
-        if self._snapshot_required(host, remediation):
+        snapshot_requirement = TrustedChangeGate.snapshot_requirement(
+            host,
+            remediation,
+        )
+        if not snapshot_requirement.decision.allowed:
+            raise NonRetryableJobError(
+                snapshot_requirement.decision.message,
+                snapshot_requirement.decision.category,
+            )
+        if snapshot_requirement.required:
             job.current_phase = "snapshot_create"
             job.progress_percent = 25
             job.updated_at = utc_now()
@@ -745,6 +738,22 @@ class SysadminService:
                 host,
             )
             self._assert_job_lease(job.id, lease_owner)
+
+        remediation = self._remediation(job.remediation_id)
+        host = self._host(remediation.host_id)
+        eligibility, remediation = self._trusted_execution_decision(
+            remediation,
+            host,
+            job,
+        )
+        if not eligibility.allowed:
+            remediation.execution_state = "blocked"
+            remediation.updated_at = utc_now()
+            self.repository.save_remediation(remediation)
+            raise NonRetryableJobError(
+                eligibility.message,
+                eligibility.category,
+            )
 
         job.current_phase = "ansible_execution"
         job.progress_percent = 30
@@ -765,20 +774,20 @@ class SysadminService:
             self._assert_job_lease(job.id, lease_owner)
         self.repository.save_log_events(result.events)
         remediation.result = result
-        remediation.execution_state = (
-            "succeeded"
-            if result.success
-            else ("blocked" if rollback_snapshot else "failed")
+        outcome = TrustedChangeGate.execution_outcome(
+            result,
+            rollback_snapshot.state if rollback_snapshot else None,
         )
+        remediation.execution_state = outcome.remediation_state
         remediation.updated_at = utc_now()
         self.repository.save_remediation(remediation)
         if not result.success:
-            if execution_failure_is_non_retryable(result.summary, result.changed):
+            if not outcome.decision.retryable:
                 raise NonRetryableJobError(
-                    result.summary,
-                    execution_failure_category(result.summary),
+                    outcome.decision.message,
+                    outcome.decision.category,
                 )
-            raise RuntimeError(result.summary)
+            raise RuntimeError(outcome.decision.message)
 
         job.status = "completed"
         job.current_phase = "completed"
@@ -922,7 +931,26 @@ class SysadminService:
                     self.repository.save_job(job)
                     continue
             remediation = self._remediation(job.remediation_id)
-            if self._timing_allows(remediation, current):
+            eligibility, remediation = self._trusted_execution_decision(
+                remediation,
+                self._host(remediation.host_id),
+                job,
+            )
+            if not eligibility.allowed:
+                remediation.execution_state = "blocked"
+                remediation.updated_at = current
+                self.repository.save_remediation(remediation)
+                self.fail_job(
+                    job,
+                    eligibility.message,
+                    remediation.host_id,
+                    retryable=False,
+                    category=eligibility.category,
+                )
+                self._sync_campaigns_for_remediation(remediation.id)
+                continue
+            timing = TrustedChangeGate.timing(remediation, current)
+            if timing.decision.allowed:
                 job.status = "queued"
                 job.current_phase = None
                 job.updated_at = current
@@ -1065,6 +1093,7 @@ class SysadminService:
     ) -> List[DurableJob]:
         current = now or utc_now()
         recovered, exhausted = self.repository.recover_expired_jobs(current)
+        dispatchable: List[DurableJob] = []
         for job in recovered:
             if job.job_type == "scan":
                 scan = self.repository.get_scan(job.scan_id or "")
@@ -1076,9 +1105,26 @@ class SysadminService:
             elif job.job_type == "remediation":
                 remediation = self.repository.get_remediation(job.remediation_id or "")
                 if remediation:
-                    remediation.execution_state = "queued"
+                    recovery = TrustedChangeGate.stale_recovery(
+                        job,
+                        exhausted=False,
+                    )
+                    remediation.execution_state = recovery.remediation_state
                     remediation.updated_at = current
                     self.repository.save_remediation(remediation)
+                    if not recovery.dispatch:
+                        self.fail_job(
+                            job,
+                            recovery.decision.message,
+                            remediation.host_id,
+                            retryable=False,
+                            category=recovery.decision.category,
+                        )
+                        self._sync_campaigns_for_remediation(
+                            remediation.id,
+                            stop_remaining=True,
+                        )
+                        continue
             elif job.job_type == "snapshot_delete":
                 snapshot = self.repository.get_rollback_snapshot(
                     str(job.result.get("rollback_snapshot_id") or "")
@@ -1094,6 +1140,7 @@ class SysadminService:
                 job.id,
                 {"attempt": job.attempts},
             )
+            dispatchable.append(job)
         for job in exhausted:
             if job.job_type == "scan":
                 scan = self.repository.get_scan(job.scan_id or "")
@@ -1105,7 +1152,11 @@ class SysadminService:
             elif job.job_type == "remediation":
                 remediation = self.repository.get_remediation(job.remediation_id or "")
                 if remediation:
-                    remediation.execution_state = "failed"
+                    recovery = TrustedChangeGate.stale_recovery(
+                        job,
+                        exhausted=True,
+                    )
+                    remediation.execution_state = recovery.remediation_state
                     remediation.updated_at = current
                     self.repository.save_remediation(remediation)
             elif job.job_type == "snapshot_delete":
@@ -1118,7 +1169,7 @@ class SysadminService:
                     snapshot.updated_at = current
                     self.repository.save_rollback_snapshot(snapshot)
             self._record_terminal_job_failure(job, job.host_id)
-        return recovered
+        return dispatchable
 
     def list_jobs(self) -> List[DurableJob]:
         return sorted(
@@ -1192,7 +1243,7 @@ class SysadminService:
         if len(host_ids) != len(request.host_ids):
             raise ValueError("Campaign host selection contains duplicates")
         hosts = [self._host(host_id) for host_id in host_ids]
-        batch_size = min(host.patch_policy.max_batch_size for host in hosts)
+        batch_size = TrustedChangeGate.campaign_rollout_limit(hosts)
         now = utc_now()
         campaign_id = new_id("campaign")
         campaign = PatchCampaign(
@@ -1393,18 +1444,29 @@ class SysadminService:
     ) -> Tuple[PatchCampaign, List[DurableJob]]:
         with self.repository.transaction():
             campaign = self._sync_campaign(self._campaign_for_update(campaign_id))
-            if campaign.status in (
-                CampaignStatus.CANCELLING,
-                CampaignStatus.CANCELED,
-                CampaignStatus.SUCCEEDED,
-                CampaignStatus.FAILED,
-            ):
-                raise ValueError("Campaign cannot execute in its current state")
+            remediations = {
+                host_plan.remediation_id: self._remediation(
+                    host_plan.remediation_id
+                )
+                for host_plan in campaign.hosts
+                if host_plan.remediation_id
+            }
+            batch = TrustedChangeGate.campaign_batch(
+                campaign,
+                remediations,
+            )
+            for changed_host_id in batch.plan_changed_host_ids:
+                changed_plan = self._campaign_host(campaign, changed_host_id)
+                changed_plan.state = CampaignHostState.PLAN_CHANGED
+                changed_plan.failure_summary = GateDecision.deny(
+                    GateCode.CAMPAIGN_PLAN_CHANGED
+                ).message
+                changed_plan.updated_at = utc_now()
+            self._raise_gate_denial(batch.decision)
+            selected_host_ids = set(batch.host_ids)
             jobs: List[DurableJob] = []
             for host_plan in campaign.hosts:
-                if len(jobs) >= campaign.batch_size:
-                    break
-                if host_plan.state != CampaignHostState.APPROVED:
+                if host_plan.host_id not in selected_host_ids:
                     continue
                 if not host_plan.remediation_id:
                     continue
@@ -1417,32 +1479,32 @@ class SysadminService:
                         campaign_id=campaign.id,
                         sync_campaigns=False,
                     )
-                except ValueError as error:
-                    host_plan.state = CampaignHostState.PLAN_CHANGED
+                except GateDenied as error:
+                    host_plan.state = (
+                        CampaignHostState.PLAN_CHANGED
+                        if error.decision.category == "approval_validation"
+                        else CampaignHostState.BLOCKED
+                    )
                     host_plan.failure_summary = self._redact_text(
                         str(error),
                         host_plan.host_id,
                     )
                     host_plan.updated_at = utc_now()
                     continue
-                host_plan.job_id = job.id
-                host_plan.state = (
-                    CampaignHostState.QUEUED
-                    if job.status == "queued"
-                    else CampaignHostState.SCHEDULED
-                )
-                host_plan.updated_at = utc_now()
                 jobs.append(job)
             if not jobs:
                 self._refresh_campaign_state(campaign)
                 self.repository.save_campaign(campaign)
-                raise ValueError("Campaign has no approved host plans ready to execute")
-            campaign.status = CampaignStatus.RUNNING
-            campaign.current_batch = min(
-                campaign.total_batches,
-                campaign.current_batch + 1,
+                self._raise_gate_denial(
+                    GateDecision.deny(
+                        GateCode.CAMPAIGN_NO_APPROVED_HOSTS,
+                    )
+                )
+            campaign = TrustedChangeGate.start_campaign_batch(
+                campaign,
+                {job.host_id: job for job in jobs if job.host_id},
+                utc_now(),
             )
-            campaign.updated_at = utc_now()
             self.repository.save_campaign(campaign)
             self.audit(
                 actor,
@@ -1622,13 +1684,16 @@ class SysadminService:
         )
         self.repository.save_log_events(result.events)
         snapshot.updated_at = utc_now()
-        if not result.success:
+        creation = TrustedChangeGate.snapshot_creation(
+            result.success,
+            self._redact_text(result.summary, host.id),
+        )
+        if not creation.allowed:
             snapshot.failure_summary = self._redact_text(result.summary, host.id)
             self.repository.save_rollback_snapshot(snapshot)
             raise NonRetryableJobError(
-                "Snapshot creation failed before package changes: %s"
-                % snapshot.failure_summary,
-                "safety_validation",
+                creation.message,
+                creation.category,
             )
         snapshot.external_snapshot_id = result.external_snapshot_id
         snapshot.state = RollbackSnapshotState.CREATED
@@ -1675,8 +1740,9 @@ class SysadminService:
         )
         snapshot.health_check_result = health.checks
         snapshot.updated_at = utc_now()
-        if health.healthy:
-            snapshot.state = RollbackSnapshotState.DELETE_SCHEDULED
+        health_decision = TrustedChangeGate.post_change_health(health.healthy)
+        snapshot.state = health_decision.snapshot_state
+        if health_decision.action == PostChangeAction.COMPLETE:
             snapshot.delete_after = utc_now() + timedelta(
                 days=host.snapshot_retention_days
             )
@@ -1696,7 +1762,6 @@ class SysadminService:
             )
             return result
 
-        snapshot.state = RollbackSnapshotState.ROLLBACK_STARTED
         snapshot.failure_summary = self._redact_text(health.summary, host.id)
         self.repository.save_rollback_snapshot(snapshot)
         rollback = await self.snapshot_provider.rollback_snapshot(
@@ -1715,9 +1780,10 @@ class SysadminService:
         )
         snapshot.updated_at = utc_now()
         snapshot.failure_summary = self._redact_text(rollback.summary, host.id)
+        rollback_decision = TrustedChangeGate.rollback_result(rollback.success)
+        snapshot.state = rollback_decision.snapshot_state
+        self.repository.save_rollback_snapshot(snapshot)
         if rollback.success:
-            snapshot.state = RollbackSnapshotState.ROLLED_BACK
-            self.repository.save_rollback_snapshot(snapshot)
             self.create_alert(
                 severity=Severity.CRITICAL,
                 title="Snapshot rollback completed",
@@ -1729,13 +1795,8 @@ class SysadminService:
                 job_id=job.id,
             )
             result.success = False
-            result.summary = (
-                "Post-reboot health checks failed; snapshot rollback completed "
-                "and human intervention is required."
-            )
+            result.summary = rollback_decision.summary
         else:
-            snapshot.state = RollbackSnapshotState.ROLLBACK_FAILED
-            self.repository.save_rollback_snapshot(snapshot)
             self.create_alert(
                 severity=Severity.CRITICAL,
                 title="Snapshot rollback failed",
@@ -1747,10 +1808,7 @@ class SysadminService:
                 job_id=job.id,
             )
             result.success = False
-            result.summary = (
-                "Post-reboot health checks failed and snapshot rollback failed; "
-                "human intervention is required."
-            )
+            result.summary = rollback_decision.summary
         result.failure_actions_taken.extend(
             [
                 "snapshot rollback attempted",
@@ -1879,12 +1937,9 @@ class SysadminService:
         return self.repository.save_audit(event)
 
     @staticmethod
-    def _timing_allows(remediation: Remediation, current: datetime) -> bool:
-        if remediation.execution_timing == "immediate":
-            return True
-        if not remediation.maintenance_window:
-            return False
-        return maintenance_window_is_open(remediation.maintenance_window, current)
+    def _raise_gate_denial(decision: GateDecision) -> None:
+        if not decision.allowed:
+            raise GateDenied(decision)
 
     def _host(self, host_id: str) -> Host:
         host = self.repository.get_host(host_id)
@@ -1994,124 +2049,72 @@ class SysadminService:
             raise ValueError("Host is not selected for this campaign")
         return host_plan
 
-    @staticmethod
-    def _validate_approval_request(
-        host: Host,
-        remediation: Remediation,
-        request: ApprovalRequest,
-    ) -> None:
-        if request.hostname_confirmation != host.name:
-            raise ValueError("Typed hostname confirmation does not match")
-        if (
-            request.plan_version != remediation.plan_version
-            or request.plan_hash != remediation.plan_hash
-        ):
-            raise ValueError("The remediation plan changed and must be reviewed again")
-
     def _validate_campaign_plan_binding(
         self,
         host_plan: CampaignHostPlan,
         remediation: Remediation,
     ) -> None:
-        self._ensure_current_remediation_plan(remediation)
-        if remediation.host_id != host_plan.host_id:
-            raise ValueError("Campaign remediation host binding is invalid")
-        if (
-            host_plan.plan_version != remediation.plan_version
-            or host_plan.plan_hash != remediation.plan_hash
-        ):
+        _, remediation = self._ensure_current_remediation_plan(remediation)
+        decision = TrustedChangeGate.campaign_plan_binding(
+            host_plan,
+            remediation,
+        )
+        if not decision.allowed:
             host_plan.state = CampaignHostState.PLAN_CHANGED
-            host_plan.failure_summary = (
-                "The campaign host plan changed and must be reviewed again"
-            )
+            host_plan.failure_summary = decision.message
             host_plan.updated_at = utc_now()
             campaign = self._campaign(host_plan.campaign_id)
             self._sync_campaign(campaign)
-            raise ValueError("The campaign host plan changed and must be reviewed again")
+            self._raise_gate_denial(decision)
 
     def _ensure_current_remediation_plan(
         self,
         remediation: Remediation,
-    ) -> bool:
-        expected_hash = remediation_plan_hash(remediation)
-        content_changed = remediation.plan_hash != expected_hash
-        approval_binding_changed = (
-            remediation.approval_state == "approved"
-            and (
-                remediation.approved_plan_version != remediation.plan_version
-                or remediation.approved_plan_hash != remediation.plan_hash
-            )
+    ) -> Tuple[PlanReconciliation, Remediation]:
+        reconciliation = TrustedChangeGate.reconcile_plan(
+            remediation,
+            utc_now(),
         )
-        if not content_changed and not approval_binding_changed:
-            return False
-        previous_version = remediation.plan_version
-        previous_hash = remediation.plan_hash
-        if content_changed:
-            remediation.plan_version += 1
-            remediation.plan_hash = remediation_plan_hash(remediation)
-        remediation.approval_state = "pending"
-        remediation.approved_by = None
-        remediation.approved_at = None
-        remediation.approved_plan_version = None
-        remediation.approved_plan_hash = None
-        remediation.reboot_approval_state = (
-            "not_required"
-            if remediation.reboot_assessment.status == "not_expected"
-            else "pending"
-        )
-        remediation.reboot_approved_by = None
-        remediation.reboot_approved_at = None
-        remediation.reboot_approved_plan_version = None
-        remediation.reboot_approved_plan_hash = None
-        remediation.reboot_assessment.approved_if_required = False
-        if remediation.execution_state not in ("running", "succeeded", "failed"):
-            remediation.execution_state = "blocked"
-        remediation.updated_at = utc_now()
-        self.repository.save_remediation(remediation)
+        updated = reconciliation.remediation
+        if not reconciliation.changed:
+            return reconciliation, updated
+        self.repository.save_remediation(updated)
         self.audit(
             "system",
             "remediation.approval_invalidated",
             "remediation",
-            remediation.id,
+            updated.id,
             {
-                "previous_plan_version": previous_version,
-                "previous_plan_hash": previous_hash,
-                "plan_version": remediation.plan_version,
-                "plan_hash": remediation.plan_hash,
+                "previous_plan_version": reconciliation.previous_plan_version,
+                "previous_plan_hash": reconciliation.previous_plan_hash,
+                "plan_version": updated.plan_version,
+                "plan_hash": updated.plan_hash,
             },
         )
-        return True
+        return reconciliation, updated
 
-    @staticmethod
-    def _remediation_approval_error(
+    def _trusted_execution_decision(
+        self,
         remediation: Remediation,
         host: Host,
-    ) -> Optional[str]:
-        if remediation.approval_state != "approved":
-            return "Remediation execution requires an approved plan"
-        if not remediation.approved_by or not remediation.approved_at:
-            return "Remediation approval metadata is incomplete"
-        if (
-            remediation.approved_plan_version != remediation.plan_version
-            or remediation.approved_plan_hash != remediation.plan_hash
-        ):
-            return "Remediation plan approval no longer matches the current plan"
-        if remediation.reboot_assessment.status != "not_expected":
-            if remediation.reboot_approval_state != "approved":
-                return "Remediation execution requires separate reboot approval"
-            if (
-                not remediation.reboot_approved_by
-                or not remediation.reboot_approved_at
-                or remediation.reboot_approved_plan_version
-                != remediation.plan_version
-                or remediation.reboot_approved_plan_hash
-                != remediation.plan_hash
-                or not remediation.reboot_assessment.approved_if_required
-            ):
-                return "Remediation reboot approval metadata is incomplete"
-            if host.patch_policy.reboot_policy == "never":
-                return "Host policy forbids the approved reboot risk"
-        return None
+        job: Optional[DurableJob] = None,
+    ) -> Tuple[GateDecision, Remediation]:
+        reconciliation, updated = self._ensure_current_remediation_plan(
+            remediation
+        )
+        if reconciliation.changed:
+            return reconciliation.decision, updated
+        return (
+            TrustedChangeGate.execution_eligibility(
+                updated,
+                host,
+                job=job,
+                active_rollback_failure=self._host_has_active_rollback_failure(
+                    host.id
+                ),
+            ),
+            updated,
+        )
 
     def _mark_campaign_proposal_running(
         self,
@@ -2147,9 +2150,13 @@ class SysadminService:
             host_plan.state = CampaignHostState.AWAITING_APPROVAL
             if remediation.id not in campaign.remediation_ids:
                 campaign.remediation_ids.append(remediation.id)
-            campaign.batch_size = min(
-                campaign.batch_size,
-                remediation.rollout_policy.batch_size,
+            campaign.batch_size = TrustedChangeGate.campaign_rollout_limit(
+                [self._host(item.host_id) for item in campaign.hosts],
+                [
+                    item
+                    for item in self.repository.list_remediations()
+                    if item.id in campaign.remediation_ids
+                ],
             )
             campaign.total_batches = int(
                 math.ceil(len(campaign.hosts) / campaign.batch_size)
@@ -2198,7 +2205,7 @@ class SysadminService:
         failed_remediation_id: str,
     ) -> None:
         failed = self._remediation(failed_remediation_id)
-        if not failed.failure_policy.stop_remaining_hosts:
+        if not TrustedChangeGate.stop_campaign_after_failure(failed):
             return
         now = utc_now()
         for host_plan in campaign.hosts:
@@ -2281,244 +2288,34 @@ class SysadminService:
                 )
                 for host_id in campaign.host_ids
             ]
+        remediations: Dict[str, Remediation] = {}
+        jobs: Dict[str, DurableJob] = {}
         for host_plan in campaign.hosts:
-            if not host_plan.remediation_id:
-                continue
-            remediation = self.repository.get_remediation(host_plan.remediation_id)
-            if not remediation:
-                host_plan.state = CampaignHostState.FAILED
-                host_plan.failure_summary = "Remediation proposal no longer exists"
-                host_plan.updated_at = now
-                continue
-            plan_changed = self._ensure_current_remediation_plan(remediation)
-            if (
-                host_plan.plan_version != remediation.plan_version
-                or host_plan.plan_hash != remediation.plan_hash
-            ):
-                plan_changed = True
-            host_plan.approval_state = remediation.approval_state
-            host_plan.reboot_approval_state = remediation.reboot_approval_state
-            host_plan.approved_plan_version = remediation.approved_plan_version
-            host_plan.approved_plan_hash = remediation.approved_plan_hash
-            host_plan.approved_by = remediation.approved_by
-            host_plan.approved_at = remediation.approved_at
-            host_plan.reboot_approved_by = remediation.reboot_approved_by
-            host_plan.reboot_approved_at = remediation.reboot_approved_at
-            host_plan.reboot_approved_plan_version = (
-                remediation.reboot_approved_plan_version
-            )
-            host_plan.reboot_approved_plan_hash = (
-                remediation.reboot_approved_plan_hash
-            )
-            host_plan.failure_summary = (
-                remediation.result.summary
-                if remediation.result and not remediation.result.success
-                else host_plan.failure_summary
-            )
-            job = (
-                self.repository.get_job(host_plan.job_id)
-                if host_plan.job_id
-                else None
-            )
-            if job and job.job_type == "remediation" and job.status == "running":
-                host_plan.state = CampaignHostState.RUNNING
-            elif job and job.job_type == "remediation" and job.status == "canceled":
-                host_plan.state = CampaignHostState.CANCELED
-            elif remediation.execution_state == "succeeded":
-                host_plan.state = CampaignHostState.SUCCEEDED
-            elif remediation.execution_state == "failed":
-                host_plan.state = CampaignHostState.FAILED
-            elif remediation.execution_state == "running":
-                host_plan.state = CampaignHostState.RUNNING
-            elif remediation.execution_state == "queued":
-                host_plan.state = CampaignHostState.QUEUED
-            elif remediation.execution_state == "waiting_for_window":
-                host_plan.state = CampaignHostState.SCHEDULED
-            elif remediation.execution_state == "canceled":
-                host_plan.state = CampaignHostState.CANCELED
-            elif plan_changed or (
-                host_plan.state == CampaignHostState.PLAN_CHANGED
-                and remediation.approval_state == "pending"
-            ):
-                host_plan.state = CampaignHostState.PLAN_CHANGED
-            elif remediation.approval_state == "rejected":
-                host_plan.state = CampaignHostState.REJECTED
-            elif remediation.approval_state == "manual_review":
-                host_plan.state = CampaignHostState.BLOCKED
-            elif remediation.approval_state != "approved":
-                host_plan.state = CampaignHostState.AWAITING_APPROVAL
-            elif remediation.reboot_assessment.status != "not_expected":
-                if remediation.reboot_approval_state == "approved":
-                    host_plan.state = CampaignHostState.APPROVED
-                elif remediation.reboot_approval_state in ("blocked", "rejected"):
-                    host_plan.state = CampaignHostState.BLOCKED
-                else:
-                    host_plan.state = CampaignHostState.AWAITING_REBOOT_APPROVAL
-            else:
-                host_plan.state = CampaignHostState.APPROVED
-            host_plan.updated_at = now
-        if campaign.canceled_at:
-            campaign.status = (
-                CampaignStatus.CANCELLING
-                if any(
-                    item.state == CampaignHostState.RUNNING
-                    for item in campaign.hosts
+            if host_plan.remediation_id:
+                remediation = self.repository.get_remediation(
+                    host_plan.remediation_id
                 )
-                else CampaignStatus.CANCELED
-            )
-        elif campaign.status != CampaignStatus.CANCELED:
-            states = {
-                (
-                    item.state.value
-                    if isinstance(item.state, CampaignHostState)
-                    else str(item.state)
-                )
-                for item in campaign.hosts
-            }
-            if states == {CampaignHostState.SELECTED.value}:
-                campaign.status = CampaignStatus.DRAFT
-            elif states & {
-                CampaignHostState.PROPOSAL_QUEUED.value,
-                CampaignHostState.PROPOSAL_RUNNING.value,
-            }:
-                campaign.status = CampaignStatus.PROPOSING
-            elif states & {
-                CampaignHostState.SCHEDULED.value,
-                CampaignHostState.QUEUED.value,
-                CampaignHostState.RUNNING.value,
-            }:
-                campaign.status = CampaignStatus.RUNNING
-            else:
-                succeeded = sum(
-                    item.state == CampaignHostState.SUCCEEDED
-                    for item in campaign.hosts
-                )
-                failed = sum(
-                    item.state
-                    in (
-                        CampaignHostState.FAILED,
-                        CampaignHostState.REJECTED,
-                        CampaignHostState.BLOCKED,
-                        CampaignHostState.CANCELED,
+                if remediation:
+                    _, remediation = self._ensure_current_remediation_plan(
+                        remediation
                     )
-                    for item in campaign.hosts
-                )
-                awaiting = sum(
-                    item.state
-                    in (
-                        CampaignHostState.AWAITING_APPROVAL,
-                        CampaignHostState.AWAITING_REBOOT_APPROVAL,
-                        CampaignHostState.PLAN_CHANGED,
-                    )
-                    for item in campaign.hosts
-                )
-                approved = sum(
-                    item.state == CampaignHostState.APPROVED
-                    for item in campaign.hosts
-                )
-                actionable = [
-                    item
-                    for item in campaign.hosts
-                    if item.state != CampaignHostState.NO_ACTION
-                ]
-                if succeeded and (failed or awaiting or approved):
-                    campaign.status = CampaignStatus.PARTIALLY_SUCCEEDED
-                elif awaiting:
-                    campaign.status = CampaignStatus.AWAITING_APPROVAL
-                elif approved:
-                    campaign.status = CampaignStatus.READY
-                elif actionable and succeeded == len(actionable):
-                    campaign.status = CampaignStatus.SUCCEEDED
-                elif succeeded and failed:
-                    campaign.status = CampaignStatus.PARTIALLY_SUCCEEDED
-                elif failed and failed == len(actionable):
-                    campaign.status = CampaignStatus.FAILED
-                elif failed:
-                    campaign.status = CampaignStatus.FAILED
-                elif not actionable:
-                    campaign.status = CampaignStatus.SUCCEEDED
-                else:
-                    campaign.status = CampaignStatus.DRAFT
-            failures = [
-                item.failure_summary
-                for item in campaign.hosts
-                if item.failure_summary
-            ]
-            campaign.failure_summary = "; ".join(failures)[:2000] or None
-        campaign.remediation_ids = [
-            item.remediation_id
-            for item in campaign.hosts
-            if item.remediation_id
-        ]
-        completed_count = sum(
-            item.state
-            in (
-                CampaignHostState.SUCCEEDED,
-                CampaignHostState.FAILED,
-                CampaignHostState.CANCELED,
-                CampaignHostState.NO_ACTION,
-            )
-            for item in campaign.hosts
+                    remediations[remediation.id] = remediation
+            if host_plan.job_id:
+                job = self.repository.get_job(host_plan.job_id)
+                if job:
+                    jobs[job.id] = job
+        projected = TrustedChangeGate.project_campaign(
+            campaign,
+            remediations,
+            jobs,
+            now,
         )
-        completed_batches = (
-            int(math.ceil(completed_count / campaign.batch_size))
-            if completed_count
-            else 0
-        )
-        campaign.current_batch = min(
-            campaign.total_batches,
-            max(campaign.current_batch, completed_batches),
-        )
-        campaign.updated_at = now
-        self.repository.save_campaign(campaign)
-        return campaign
+        self.repository.save_campaign(projected)
+        return projected
 
     def _refresh_campaign_state(self, campaign: PatchCampaign) -> None:
         self._sync_campaign(campaign)
 
-    @staticmethod
-    def _snapshot_required(host: Host, remediation: Remediation) -> bool:
-        return (
-            remediation.reboot_assessment.status != "not_expected"
-            and SnapshotPlatform(host.snapshot_platform) != SnapshotPlatform.NONE
-        )
-
-    @staticmethod
-    def _remediation_binding_error(
-        job: DurableJob,
-        remediation: Remediation,
-        host: Host,
-    ) -> Optional[str]:
-        approval_error = SysadminService._remediation_approval_error(
-            remediation,
-            host,
-        )
-        if approval_error:
-            return approval_error
-        expected_scope = (
-            "patch_only"
-            if remediation.reboot_assessment.status == "not_expected"
-            else "patch_and_reboot_if_required"
-        )
-        if job.approval_scope != expected_scope:
-            return "Durable job approval scope is invalid"
-        if job.approved_plan_version != remediation.plan_version:
-            return "Remediation plan version changed after approval"
-        if job.approved_plan_hash != remediation.plan_hash:
-            return "Remediation plan hash changed after approval"
-        if (
-            remediation.approved_plan_version is not None
-            and remediation.approved_plan_version != job.approved_plan_version
-        ):
-            return "Approved remediation plan version binding changed"
-        if (
-            remediation.approved_plan_hash is not None
-            and remediation.approved_plan_hash != job.approved_plan_hash
-        ):
-            return "Approved remediation plan hash binding changed"
-        if remediation.plan_hash != remediation_plan_hash(remediation):
-            return "Remediation content changed from the approved plan"
-        return None
 
 
 def next_cron_run(expression: str, timezone_name: str, after: datetime) -> datetime:
@@ -2530,82 +2327,12 @@ def next_cron_run(expression: str, timezone_name: str, after: datetime) -> datet
     return croniter(expression, local).get_next(datetime).astimezone(ZoneInfo("UTC"))
 
 
-def maintenance_window_is_open(window: MaintenanceWindow, current: datetime) -> bool:
-    zone = ZoneInfo(window.timezone)
-    local = current.astimezone(zone)
-    if local.weekday() not in window.weekdays:
-        return False
-    hour, minute = [int(part) for part in window.start_time.split(":", 1)]
-    start = datetime.combine(local.date(), time(hour, minute), zone)
-    end = start + timedelta(minutes=window.duration_minutes)
-    return start <= local < end
-
-
-def material_state_changed(previous, current) -> bool:
-    previous_packages = sorted(
-        (item.name, item.candidate_version)
-        for item in previous.package_summary.updates
-    )
-    current_packages = sorted(
-        (item.name, item.candidate_version)
-        for item in current.package_summary.updates
-    )
-    return any(
-        (
-            previous_packages != current_packages,
-            sorted(previous.service_summary.failed_units)
-            != sorted(current.service_summary.failed_units),
-            previous.package_summary.reboot_required_now
-            != current.package_summary.reboot_required_now,
-        )
-    )
-
-
 def execution_phase(name: str, state: str, summary: str) -> ExecutionPhase:
     return ExecutionPhase(name=name, state=state, summary=summary)
 
 
 def severity_text(value: Any) -> str:
     return value.value if isinstance(value, Severity) else str(value)
-
-
-def execution_failure_category(summary: str) -> str:
-    lowered = summary.lower()
-    if "approv" in lowered or "plan" in lowered:
-        return "approval_validation"
-    if any(
-        marker in lowered
-        for marker in (
-            "host key",
-            "blocked",
-            "snapshot",
-            "rollback",
-            "health check",
-            "human intervention",
-        )
-    ):
-        return "safety_validation"
-    return "remediation_execution"
-
-
-def execution_failure_is_non_retryable(summary: str, changed: bool) -> bool:
-    lowered = summary.lower()
-    return changed or any(
-        marker in lowered
-        for marker in (
-            "approval",
-            "approved",
-            "plan changed",
-            "host key",
-            "execution blocked",
-            "reboot scope",
-            "policy forbids",
-            "snapshot",
-            "rollback",
-            "health check",
-            "human intervention",
-        )
-    )
 
 
 def agent_events(

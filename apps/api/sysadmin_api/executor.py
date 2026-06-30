@@ -20,6 +20,7 @@ from .models import (
 )
 from .redaction import redact_text, sanitize_log_event
 from .ssh_utils import scan_host_key, temporary_known_hosts
+from .trusted_change import TrustedChangeGate
 
 
 PLAYBOOK_CATALOG = {
@@ -31,10 +32,6 @@ PLAYBOOK_CATALOG = {
     "validate": "post-patch-validation.yml",
     "recovery": "recovery-diagnostics.yml",
 }
-SUPPORTED_ACTION_TYPES = {"package_upgrade"}
-SUPPORTED_UPDATE_SCOPES = {"security", "all"}
-
-
 class RemediationExecutor(ABC):
     @abstractmethod
     async def execute(
@@ -169,6 +166,23 @@ class AnsibleExecutor(RemediationExecutor):
                     ("package_upgrade", remediation.update_scope),
                     ("reboot_required_check", "reboot_check"),
                 ):
+                    if phase_name == "package_upgrade":
+                        mutation_guard = TrustedChangeGate.execution_eligibility(
+                            remediation,
+                            host,
+                        )
+                        if not mutation_guard.allowed:
+                            return ExecutionResult(
+                                success=False,
+                                summary=mutation_guard.message,
+                                changed=False,
+                                reboot_performed=False,
+                                phases=phases,
+                                events=events,
+                                failure_actions_taken=[
+                                    "operator alert recorded"
+                                ],
+                            )
                     success, output, phase_events = await self._run_playbook(
                         host,
                         remediation,
@@ -212,10 +226,14 @@ class AnsibleExecutor(RemediationExecutor):
                     or remediation.reboot_assessment.status == "required"
                 )
                 if reboot_required:
-                    if (
-                        host.patch_policy.reboot_policy == "never"
-                        or not remediation.reboot_assessment.approved_if_required
-                    ):
+                    reboot_decision = (
+                        TrustedChangeGate.reboot_execution_eligibility(
+                            remediation,
+                            host,
+                            reboot_required=True,
+                        )
+                    )
+                    if not reboot_decision.allowed:
                         return await self._failure(
                             host,
                             remediation,
@@ -478,38 +496,5 @@ def failure_result(summary: str) -> ExecutionResult:
 
 
 def approval_guard(host: Host, remediation: Remediation) -> str:
-    if remediation.approval_state != "approved":
-        return "Execution blocked because the remediation is not approved"
-    if remediation.approval_scope != "patch_only":
-        return "Execution blocked because the approval scope is invalid"
-    if remediation.action_type not in SUPPORTED_ACTION_TYPES:
-        return "Execution blocked because the remediation action type is not cataloged"
-    if remediation.update_scope not in SUPPORTED_UPDATE_SCOPES:
-        return "Execution blocked because the remediation update scope is not cataloged"
-    if not remediation.approved_by or not remediation.approved_at:
-        return "Execution blocked because approval metadata is incomplete"
-    if (
-        remediation.approved_plan_version != remediation.plan_version
-        or remediation.approved_plan_hash != remediation.plan_hash
-    ):
-        return "Execution blocked because approval does not match the current plan"
-    if (
-        remediation.reboot_assessment.status != "not_expected"
-        and (
-            remediation.reboot_approval_state != "approved"
-            or not remediation.reboot_assessment.approved_if_required
-            or not remediation.reboot_approved_by
-            or not remediation.reboot_approved_at
-            or remediation.reboot_approved_plan_version
-            != remediation.plan_version
-            or remediation.reboot_approved_plan_hash
-            != remediation.plan_hash
-        )
-    ):
-        return "Execution blocked because separate reboot approval is missing"
-    if (
-        host.patch_policy.reboot_policy == "never"
-        and remediation.reboot_assessment.status != "not_expected"
-    ):
-        return "Execution blocked because host policy forbids reboot risk"
-    return ""
+    decision = TrustedChangeGate.execution_eligibility(remediation, host)
+    return "" if decision.allowed else decision.message

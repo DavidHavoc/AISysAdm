@@ -50,6 +50,44 @@ def test_sql_repository_claims_a_durable_job_once(tmp_path):
     assert repository.get_job(job.id).status == "running"
 
 
+def test_sql_recovery_preserves_the_interrupted_execution_phase(tmp_path):
+    repository = SqlRepository(
+        "sqlite:///%s" % (tmp_path / "recovery.db"),
+        create_schema=True,
+    )
+    now = utc_now()
+    job = DurableJob(
+        id="job-remediation-recovery",
+        job_type="remediation",
+        status="queued",
+        host_id="host-1",
+        scan_id="scan-1",
+        remediation_id="remediation-1",
+        idempotency_key="remediation:recovery",
+        created_at=now,
+        updated_at=now,
+    )
+    repository.save_job(job)
+    claimed = repository.claim_job(
+        job.id,
+        "worker-1",
+        now,
+        now + timedelta(seconds=5),
+    )
+    claimed.current_phase = "ansible_execution"
+    claimed.updated_at = now + timedelta(seconds=1)
+    repository.save_job(claimed, lease_owner="worker-1")
+
+    recovered, exhausted = repository.recover_expired_jobs(
+        now + timedelta(seconds=6)
+    )
+
+    assert exhausted == []
+    assert [item.id for item in recovered] == [job.id]
+    assert recovered[0].current_phase == "retry_scheduled"
+    assert recovered[0].result["recovered_from_phase"] == "ansible_execution"
+
+
 def test_sql_repository_purges_only_expired_logs(tmp_path):
     repository = SqlRepository(
         "sqlite:///%s" % (tmp_path / "logs.db"),

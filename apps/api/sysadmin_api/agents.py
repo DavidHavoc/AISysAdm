@@ -29,6 +29,7 @@ from .models import (
 )
 from .providers import ModelRouter, ProviderCompletion, ProviderError, RoutedModel
 from .redaction import compact_json, redact_payload, redact_text
+from .trusted_change import TrustedChangeGate
 from .verifier import DeterministicVerifier
 
 
@@ -43,33 +44,6 @@ def stable_hash(value: Any) -> str:
 
 def severity_value(value: Any) -> str:
     return value.value if isinstance(value, Severity) else str(value)
-
-
-def remediation_plan_hash(remediation: Remediation) -> str:
-    reboot = remediation.reboot_assessment.model_dump(mode="json")
-    reboot.pop("approved_if_required", None)
-    return stable_hash(
-        {
-            "plan_version": remediation.plan_version,
-            "host_id": remediation.host_id,
-            "scan_id": remediation.scan_id,
-            "action_type": remediation.action_type,
-            "update_scope": remediation.update_scope,
-            "risk_level": severity_value(remediation.risk_level),
-            "decision": remediation.ai_decision.model_dump(mode="json"),
-            "reboot": reboot,
-            "rollout": remediation.rollout_policy.model_dump(mode="json"),
-            "failure_policy": remediation.failure_policy.model_dump(mode="json"),
-            "timing": remediation.execution_timing,
-            "maintenance_window": (
-                remediation.maintenance_window.model_dump(mode="json")
-                if remediation.maintenance_window
-                else None
-            ),
-            "approval_scope": remediation.approval_scope,
-            "pre_change_protection": remediation.pre_change_protection,
-        }
-    )
 
 
 @dataclass
@@ -731,7 +705,7 @@ class OrchestratorAgent:
                 "provider": host.snapshot_platform,
                 "retention_days": host.snapshot_retention_days,
             }
-        remediation.plan_hash = remediation_plan_hash(remediation)
+        remediation.plan_hash = TrustedChangeGate.plan_hash(remediation)
         return remediation
 
 
